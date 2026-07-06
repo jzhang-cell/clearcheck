@@ -1,0 +1,13 @@
+.env
+.env.local
+.DS_Store
+node_modules/
+supabase/.temp/
+supabase/.branches/
+tmp/
+
+# Internal agent-mode reference docs — kept local, not pushed
+agents/
+
+# Zips can bundle secrets (e.g. tmp.zip had the Drive SA key)
+*.zip
