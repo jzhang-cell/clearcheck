@@ -8,8 +8,8 @@
 -- WHY: a hard edge wall-clock kill leaves a job_runs row orphaned in 'running'
 -- forever — the killed worker can't self-report. Something outside it must notice
 -- and surface the stall. This cron job pokes the watchman every 5 minutes; the
--- watchman marks orphaned rows 'failed' and writes a recovery message to the
--- control's "ClearCheck 💬" so the auditor knows to press Re-run.
+-- watchman marks orphaned rows 'failed' to unjam capacity. Explicit Airtable
+-- recovery is a separate request mode that restarts selected bad controls.
 --
 -- ── PREREQUISITES (apply on the project BEFORE this migration) ──────────────
 --   1. Extensions: pg_cron + pg_net enabled

@@ -1,10 +1,10 @@
-// pace-controls — the durable fan-out THROTTLE (ADR-014).
+// pace-controls — the durable fan-out THROTTLE (ADR-014, Batch Test 01).
 //
 // Problem it solves: an engagement run launches every control at once. Each
 // control's evidence-ingest (sync-control-evidence) opens several DB connections,
 // so dozens of controls firing together exhaust the Postgres pooler ("no more
-// connections allowed"), which cascades into every downstream failure seen in
-// early full-engagement testing. The Airtable tick script CAN'T fix this — it's capped at
+// connections allowed"), which cascades into every downstream failure we saw in
+// docs/BATCH_TEST_01.md. The Airtable tick script CAN'T fix this — it's capped at
 // ~30s and has no setTimeout, so it can only spread the initial burst, not pace
 // to completion.
 //
@@ -40,6 +40,7 @@ import { getServiceClient } from "../_shared/supabase-client.ts";
 import { resolveEngagementByKey } from "../_shared/auth.ts";
 import { listAirtableRecords, patchAirtableRecord } from "../_shared/airtable.ts";
 import { completeJobRun, failJobRun, startJobRun } from "../_shared/job-run.ts";
+import { fetchWithRetry } from "../_shared/retry.ts";
 import { planWave } from "./pace-logic.ts";
 
 const DEFAULT_MAX_CONCURRENT = Math.max(
@@ -77,13 +78,23 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 //
 // Counted ACROSS engagements, not just this one: the pooler the cap protects is
 // shared, so two engagements each pacing to maxConcurrent in isolation would sum
-// to 2× the safe ceiling (the original pooler-exhaustion failure, one level up). planWave
+// to 2× the safe ceiling (the Batch Test 01 failure, one level up). planWave
 // enforces global cap + per-engagement fair share from this snapshot.
 const IN_FLIGHT_FUNCTIONS = [
   "register-control",
   "refine-control",
   "sync-control-evidence",
 ];
+
+// Ignore 'running' rows older than this when counting in-flight work. No edge
+// invocation can legitimately run this long, so an older row is an orphan from a
+// killed worker — NOT live work. Batch Test 04 challenge #1: 143 dead rows from
+// June counted as in-flight, planWave saw zero slots, and pacing launched
+// nothing in any base. The sweeper normally fails such rows first (8m threshold,
+// 5m cadence), but pacing correctness must not depend on the sweeper being
+// deployed/scheduled — this filter is the belt to its suspenders.
+const STALE_INFLIGHT_MIN = Math.max(5, Number(Deno.env.get("STALE_INFLIGHT_MIN") ?? "15"));
+
 interface InFlightSnapshot {
   own: number; // this engagement's running jobs
   others: number; // all other engagements' running jobs
@@ -91,11 +102,13 @@ interface InFlightSnapshot {
 }
 async function countInFlight(engagementId: string): Promise<InFlightSnapshot> {
   const supabase = getServiceClient();
+  const freshCutoff = new Date(Date.now() - STALE_INFLIGHT_MIN * 60_000).toISOString();
   const { data, error } = await supabase
     .from("job_runs")
     .select("engagement_id")
     .in("function_name", IN_FLIGHT_FUNCTIONS)
-    .eq("status", "running");
+    .eq("status", "running")
+    .gte("started_at", freshCutoff);
   if (error) {
     console.error(`countInFlight failed: ${error.message}`);
     // Fail safe: report own as "full" so planWave launches nothing this cycle.
@@ -116,6 +129,9 @@ async function countInFlight(engagementId: string): Promise<InFlightSnapshot> {
 }
 
 // Fire-and-forget re-invoke of THIS function to continue pacing past the budget.
+// Retried (Batch Test 04 follow-up): a single dropped POST here silently ended
+// pacing for the whole engagement. The target acks 202 before pacing, so a 5xx
+// almost certainly means it never started and a retry is safe.
 async function triggerSelf(inboundKey: string, body: RequestPayload): Promise<void> {
   const base = Deno.env.get("SUPABASE_URL");
   if (!base || !inboundKey) {
@@ -123,11 +139,11 @@ async function triggerSelf(inboundKey: string, body: RequestPayload): Promise<vo
     return;
   }
   try {
-    const res = await fetch(`${base}/functions/v1/pace-controls`, {
+    const res = await fetchWithRetry(`${base}/functions/v1/pace-controls`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-audit-secret": inboundKey },
       body: JSON.stringify(body),
-    });
+    }, { label: "trigger pace-controls" });
     if (!res.ok) console.error(`triggerSelf(pace-controls): HTTP ${res.status}`);
   } catch (e) {
     console.error(`triggerSelf(pace-controls) failed: ${(e as Error).message}`);
@@ -183,7 +199,11 @@ Deno.serve(async (req: Request) => {
   const job = await startJobRun({
     function_name: "pace-controls",
     trigger_source: "airtable",
-    payload: { controls_table_id: controlsTableId, run_field: runField, max_concurrent: maxConcurrent },
+    payload: {
+      controls_table_id: controlsTableId,
+      run_field: runField,
+      max_concurrent: maxConcurrent,
+    },
     engagement_id: engagementId,
   });
 

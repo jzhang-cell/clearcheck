@@ -114,6 +114,19 @@ const CONFORMITY_LEVEL_TO_STATUS: Record<string, string> = {
   "Incomplete Assessment": "Incomplete Assessment",
 };
 
+// Airtable's V3_Conformity_Level is a 3-option dropdown: "No Deviation" /
+// "Deviation" / "Pending conclusion". "No Deviation" and "Deviation" pass
+// through unchanged; every other granular level (Observation — …, Incomplete
+// Assessment) collapses to "Pending conclusion". The full granular level
+// survives in audit_results and in the V3_Determination text. A singleSelect
+// PATCH with any other value would 422 and take the whole write-back down
+// with it.
+const DROPDOWN_PASSTHROUGH_LEVELS = new Set(["No Deviation", "Deviation"]);
+
+export function conformityLevelToDropdown(level: string): string {
+  return DROPDOWN_PASSTHROUGH_LEVELS.has(level) ? level : "Pending conclusion";
+}
+
 const REQUIRED_AUDIT_TAGS = [
   "conformity_level",
   "root_cause",

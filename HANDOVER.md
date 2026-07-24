@@ -1,92 +1,166 @@
-# SOC 2 ClearCheck — Handover
+# ClearCheck — Client Handover
 
-Welcome. This is the starting point for the SOC 2 ClearCheck system. It's written in plain
-English so anyone — technical or not — can understand what this is and where to look next.
+This document is the entry point for taking ownership of ClearCheck. It explains
+what the system does, what is live, where the operational responsibilities sit,
+and what must be confirmed before the handover is complete.
 
----
+ClearCheck supports an auditor's review; it does not replace professional
+judgment or final sign-off.
 
-## What is SOC 2 ClearCheck?
+## Handover status
 
-SOC 2 ClearCheck is an **AI assistant for auditors**. It reads a company's security evidence
-(PDFs, spreadsheets, screenshots, documents), decides whether each security control is being
-followed, and writes up its finding — like a first-draft audit note. The auditor reviews and
-signs off. It turns hours of manual reading into a few minutes of review.
+| Area | Status | Required action |
+|---|---|---|
+| Production service | Live in Supabase project `kwuymtlpjkziqkumixvk` | Confirm the incoming technical owner has dashboard access. |
+| Auditor workflow | Live in Airtable | Confirm the production automations match the reference scripts. |
+| Evidence sources | Airtable attachments first, Google Drive as fallback | Confirm both sources with a test control. |
+| Large PDFs | Offloaded to Make.com when configured | Confirm the Make scenario, connection owner, and callback secret. |
+| This repository | Production source synchronized on `codex/refine-handover-notes` from production commit `052c55d` | Review and merge the draft PR, then record the accepted client-repository commit. |
+| Ownership transfer | Pending acceptance | Complete the checklist at the end of this document. |
 
-The auditor does everything from a simple **Airtable** screen: tick a box to run a control,
-watch the progress, and read the result. No code or technical steps are needed to use it.
+> **Important:** the production source has been synchronized onto the handover
+> review branch, including the durable audit worker, Make.com large-PDF
+> callback, external extraction tables, Airtable-first evidence selection, and
+> enhanced sweep verification. Do not deploy it until the draft PR is reviewed,
+> merged, and tagged as the accepted handover release.
 
----
+## What ClearCheck does
 
-## Where to start (pick your guide)
+ClearCheck is an AI-assisted SOC 2 evidence-review pipeline. For each control it:
 
-| If you are… | Read this |
+1. receives the control and its expected audit procedures from Airtable;
+2. refines the wording of the control and procedures;
+3. collects evidence from Airtable or Google Drive;
+4. extracts and indexes the relevant content;
+5. prepares a suggested conformity conclusion and workpaper; and
+6. writes the status, conclusion, evidence, and workpaper back to Airtable.
+
+The auditor reviews the evidence and generated workpaper and remains responsible
+for the final conclusion.
+
+## Where to start
+
+| Audience | Start here |
 |---|---|
-| **An auditor / everyday user** | [docs/USER_GUIDE.md](docs/USER_GUIDE.md) — what it is and how to use it, step by step, in plain English. |
-| **An engineer taking over the system** | [docs/TECHNICAL_HANDOVER.md](docs/TECHNICAL_HANDOVER.md) — the full technical picture: how it's built, how to deploy, and how to maintain it. |
+| Auditor or engagement manager | [User Guide](docs/USER_GUIDE.md) |
+| Technical owner | [Technical Handover](docs/TECHNICAL_HANDOVER.md) |
+| Operations/support | [Runbook](RUNBOOK.md) |
+| Security reviewer | [Security](SECURITY.md) |
+| Developer | [Architecture](ARCHITECTURE.md) and [Decision Records](DECISIONS.md) |
 
----
+## Production flow
 
-## How it works, in one picture
-
+```text
+Airtable: Run V3 Audit
+        │
+        ├─ register and refine the control
+        │
+        ├─ select evidence
+        │    ├─ use V3_Evidence attachments when present
+        │    └─ otherwise use the control's Google Drive folder
+        │
+        ├─ extract evidence
+        │    ├─ ordinary files: Supabase/Claude
+        │    └─ large PDFs: Make.com, then callback to Supabase
+        │
+        ├─ enqueue the audit in Supabase
+        │
+        ├─ judge the evidence and render the workpaper
+        │
+        └─ write the final result to Airtable
 ```
-  Auditor ticks "Run V3 Audit" in Airtable
-                 │
-                 ▼
-  1. Register the control
-  2. Tidy up its description
-  3. Pull its evidence from Google Drive and READ it with AI
-  4. JUDGE whether the control is met, and WRITE UP the finding
-                 │
-                 ▼
-  The verdict + write-up appear back in Airtable for the auditor to review
-```
 
-Everything runs automatically in the background once the box is ticked.
+Long-running work is asynchronous. Airtable receives a quick acknowledgement,
+while Supabase continues the work and updates `ClearCheck 💬` as each stage
+finishes.
 
----
+## System boundaries
 
-## What's in this repository
-
-| Folder / file | What it is |
+| Service | Responsibility |
 |---|---|
-| `supabase/` | The backend — the database, the functions that do the work, and the AI prompts. |
-| `airtable/` | The small scripts that connect the Airtable buttons to the backend. |
-| `scripts/` | Helper tools (e.g. syncing prompts, creating engagement keys). |
-| `docs/` | Documentation, including the two guides above. |
-| `ARCHITECTURE.md`, `SECURITY.md`, `RUNBOOK.md`, `DECISIONS.md` | Deeper technical and operational references. |
+| Airtable | Auditor interface, automation triggers, evidence attachments, results |
+| Supabase | Database, private file storage, functions, durable queues, cron, secrets |
+| Anthropic Claude | Evidence extraction, control refinement, audit judgment, workpaper drafting |
+| OpenAI | Evidence embeddings used for search and retrieval |
+| Google Drive | Default evidence source when `V3_Evidence` is empty |
+| Make.com | External processing for large PDFs only |
+| GitHub | Version-controlled source, prompts, scripts, migrations, and documentation |
 
----
+## What the incoming owner must receive
 
-## The main things to know
+Access should be transferred through the relevant service's user-management
+features, not by sharing personal passwords.
 
-- **The AI models used:** Claude (for reading evidence, judging, and writing) and OpenAI
-  (for evidence search). API keys for both are required.
-- **Where evidence comes from:** a Google Drive folder per control.
-- **Where results appear:** the Airtable control row (status, rating, and the written note).
-- **Each client is kept separate** and every action is logged, so the system is safe to run
-  for many clients.
+- GitHub repository access
+- Supabase production-project access
+- Airtable base and automation access
+- Anthropic and OpenAI account/billing access
+- Google Workspace and service-account administration
+- Make.com organization, scenario, connection, and execution-history access
+- the approved password-manager vault containing operational secrets
+- billing ownership and alert contacts for every paid service
 
-For anything deeper, the two guides above and the reference docs cover it.
+## Responsibilities to assign
 
----
+Do not complete the handover until each role has a named owner.
 
-## Release notes — v1.0 (July 2026)
+| Responsibility | Owner |
+|---|---|
+| Final audit judgment and workpaper approval | _Assign_ |
+| Airtable schema and automations | _Assign_ |
+| Supabase database, functions, cron, and incident response | _Assign_ |
+| AI provider billing, rate limits, and model changes | _Assign_ |
+| Google Drive permissions and service account | _Assign_ |
+| Make.com large-PDF scenario | _Assign_ |
+| Secrets rotation and access reviews | _Assign_ |
+| GitHub releases and production deployments | _Assign_ |
 
-- Full pipeline live in production: register → refine control → pull & read evidence
-  (Google Drive) → AI audit judgment → write-up back in Airtable.
-- Per-client isolation enforced at the database level (row-level security + a separate
-  API key per engagement), with an adversarial test proving it.
-- Engagement-wide runs are paced automatically to protect the database, with fair
-  sharing between clients running at the same time.
-- Transient network hiccups (Airtable rate limits, Drive blips) retry automatically;
-  a watchdog detects stalled jobs and tells the auditor how to recover.
-- A re-run (remediation) flow lets an auditor add evidence or notes after a first
-  verdict and get an updated judgment at a fraction of the cost.
+## Known operational constraints
 
----
+- AI output can vary and must be reviewed by an auditor.
+- Airtable automation scripts are copied into Airtable; editing a repository
+  file does not update the live automation automatically.
+- Prompt files are loaded into the Supabase `prompts` table; editing Markdown
+  alone does not change production.
+- Initial large-PDF extraction can use Make.com. Additional-evidence remediation
+  currently uses the local extraction path.
+- A lost Make callback can leave a sync waiting until the scheduled watchman
+  closes it and reports a retry message.
+- Per-engagement API keys isolate clients, but the current pilot does not
+  identify individual Airtable users.
 
-## Security note
+## Handover acceptance checklist
 
-All secrets (Claude / OpenAI / Airtable / Google keys) live in **Supabase Vault** and the
-gitignored `supabase/functions/.env` — never in the code. If any keys were shared during
-development, rotate them as part of taking the system over.
+### Access and ownership
+
+- [ ] Every service in “What the incoming owner must receive” has at least two
+      authorized administrators.
+- [ ] Billing ownership and rate-limit alerts have been transferred.
+- [ ] Shared or development-era credentials have been rotated.
+- [ ] The incoming owner knows where the approved password-manager vault lives.
+
+### Source and configuration
+
+- [ ] The synchronized production-source PR has been reviewed and merged.
+- [ ] The default branch and production release/commit have been recorded.
+- [ ] Airtable's live scripts have been compared with `airtable/`.
+- [ ] Active Supabase prompts have been compared with `supabase/prompts/`.
+- [ ] Supabase migrations and deployed function versions match the release.
+- [ ] The Make.com scenario and callback contract match the source documentation.
+
+### Operational proof
+
+- [ ] Run one small-PDF control from start to finish.
+- [ ] Run one PDF over 50 pages and confirm the Make callback completes.
+- [ ] Run one control using non-empty `V3_Evidence` and confirm Drive is skipped.
+- [ ] Perform an additional-evidence or additional-notes remediation.
+- [ ] Confirm the final Airtable workpaper and status fields are populated.
+- [ ] Confirm cron cleanup and bad-control sweep recovery are healthy.
+- [ ] Confirm the incoming owner can find a failed job and its cause.
+
+### Final acceptance
+
+- [ ] Known limitations and open risks have been reviewed and accepted.
+- [ ] Incident contacts and response expectations have been agreed.
+- [ ] A handover date and outgoing-support end date have been recorded.
+- [ ] The incoming technical and audit owners have signed off.

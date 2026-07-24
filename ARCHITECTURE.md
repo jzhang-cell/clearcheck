@@ -1,103 +1,212 @@
-# ClearCheck V3 — Architecture
+# ClearCheck — Architecture
 
-> Technical design and trade-offs. Read alongside [DECISIONS.md](./DECISIONS.md) for the "why".
+This document describes the live production design. See
+[docs/TECHNICAL_HANDOVER.md](docs/TECHNICAL_HANDOVER.md) for operations and
+deployment.
 
-## V2 → V3
+> The handover review branch was synchronized from production source commit
+> `052c55d`. Complete PR review and handover acceptance before deploying from
+> the client repository.
 
-| | V2 | V3 |
-|---|---|---|
-| Orchestration | Make.com scenarios | Supabase Edge Functions (Deno/TS) |
-| Latency | multi-hop webhooks | direct function → Claude |
-| Observability | Make run history | every call in `job_runs` (tokens, cost, errors) |
-| Cost/control | per-operation Make pricing | own infra, tiered Claude models |
-| Frontend | Airtable | Airtable (unchanged for auditors) |
+## Design goals
 
-## V3 internal flow
+- Keep the auditor workflow in Airtable.
+- Isolate every engagement at the database boundary.
+- Acknowledge Airtable quickly and perform slow work asynchronously.
+- Store durable workflow state outside individual Edge Function invocations.
+- Keep evidence identity, storage, and audit decisions in Supabase.
+- Use external processing only where platform limits require it.
+- Make failures observable and recoverable without claiming false completion.
 
+## Context
+
+```text
+Auditor
+  │
+  ▼
+Airtable ───────────────► Supabase Edge Functions
+                              │
+                              ├─► Postgres + pgvector
+                              ├─► Private Storage
+                              ├─► Anthropic Claude
+                              ├─► OpenAI embeddings
+                              ├─► Google Drive
+                              └─► Make.com (large PDFs)
+                                      │
+                                      └─► callback to Supabase
 ```
-Auditor ticks "Run V3 Audit" (Airtable)
-  → Airtable Automation: refine-control → run-audit  (fire-and-forget POST + x-audit-secret)
-    → [auth boundary: checkSharedSecret]
-    → run-audit: load control + engagement + linked evidence
-    → Claude Opus  → conformity verdict
-    → Claude Sonnet (temp 0) → workpaper markdown
-    → write audit_runs / audit_results (Supabase)
-    → PATCH V3_* fields back to the Airtable row
-  → auditor refreshes, sees the verdict ~30–60s later
+
+Airtable is the interaction surface. Supabase is the system of record for
+workflow and audit state.
+
+## Initial-control flow
+
+```text
+register-control
+      │
+refine-control
+      │
+sync-control-evidence
+      │
+      ├─ V3_Evidence attachments, when non-empty
+      └─ Google Drive folder, otherwise
+      │
+      ├─ ordinary extraction in Supabase
+      └─ large PDF → Make.com → make-extraction-callback
+      │
+audit_queue
+      │
+audit-worker
+      │
+shared audit pipeline
+      │
+audit_runs + audit_results + Airtable write-back
 ```
 
-## Edge Functions (5)
+### Why the queue matters
 
-| Function | Trigger | Does | Models | Logs |
-|---|---|---|---|---|
-| `register-engagement` | Airtable master script | upsert engagement, mint per-engagement key, store Airtable base id | — | job_runs |
-| `register-control` | Airtable per-control | upsert control + link TSCs; returns `control_uuid` | — | job_runs |
-| `refine-control` | Airtable per-control | polish control description + expected procedure; write `V3_Refined_*` back | Haiku | job_runs |
-| `sync-control-evidence` | Airtable per-control | pull Drive folder → Storage → ingest (concurrent, async), then trigger run-audit | Haiku + OpenAI | job_runs |
-| `run-audit` | chained by sync | synthesis → judgment → workpaper → DB + Airtable write-back (async) | Opus + Sonnet | job_runs |
+Evidence sync can finish near an Edge Function time limit. A fire-and-forget
+HTTP call could be lost if the worker is terminated. The `audit_queue` row is a
+durable handoff: once it exists, the audit worker can claim or retry it even
+after the sync invocation ends.
 
-Auth (ADR-011): `register-engagement` uses the shared `AUDIT_SHARED_SECRET`; the other four use a **per-engagement key** + `withEngagementScope()`. All: `verify_jwt=false`, `startJobRun`/`completeJobRun`/`failJobRun`. *(The old single-file `ingest-evidence` / `ingest-evidence-batch` were retired 2026-06-27 — ingestion now lives inside `sync-control-evidence`.)*
+### Why Make.com is limited to extraction
 
-**Engagement resolution (run-audit):** the control_id from the request loads the `controls` row, which carries `engagement_id` (→ stamps `audit_runs`, resolves the Airtable base) and `airtable_record_id` (→ the exact Airtable row). See [run-audit/index.ts:84](supabase/functions/run-audit/index.ts#L84), [:308](supabase/functions/run-audit/index.ts#L308), [:338](supabase/functions/run-audit/index.ts#L338), [:521-523](supabase/functions/run-audit/index.ts#L521-L523).
+Large PDFs can exceed convenient Edge Function processing limits. Make.com
+extracts and aggregates them, then returns one structured result. Supabase still
+owns:
 
-## Database schema (13 tables + RLS)
+- file hashing and deduplication;
+- private Storage;
+- embeddings;
+- evidence and control links;
+- sync completion;
+- audit queueing; and
+- Airtable mirroring.
+
+This keeps one source of truth and prevents external scenarios from bypassing
+workflow invariants.
+
+## Re-run architecture
+
+The plain **Run** option starts another full evidence sync. Additional Evidence
+and Additional Notes use `rerun-audit`, which evaluates the prior conclusion
+against only the new material. Each remediation creates a new `audit_runs` row
+linked to the prior run.
+
+## Engagement-wide pacing
+
+`pace-controls` launches controls in waves under a configured global cap. It
+fair-shares capacity across active engagements and watches connection-heavy
+evidence-sync work. It self-chains within an execution budget until every
+control is launched.
+
+This avoids using Airtable's short automation runtime as a batch scheduler and
+protects the Supabase connection pool.
+
+## Recovery architecture
+
+### Audit worker
+
+Queue rows move through:
+
+```text
+pending → processing → done
+                  └──→ pending (retry)
+                  └──→ dead
+```
+
+Leases allow a new worker to reclaim work after a terminated invocation.
+
+### Evidence sync
+
+`evidence_sync_runs` provides one durable lifecycle for initial evidence
+collection. Large-PDF sub-jobs live in `external_extraction_jobs`.
+
+### Scheduled watchman
+
+`sweep-stuck-jobs` runs every five minutes:
+
+- closes impossible old `running` job rows;
+- closes external extraction jobs after a conservative stale cutoff;
+- supports selected-control recovery from Airtable; and
+- verifies the exact restarted sync, audit, worker result, and Airtable
+  write-back before reporting full recovery.
+
+## Function inventory
+
+| Function | Category |
+|---|---|
+| `register-engagement` | Setup |
+| `register-control` | Setup |
+| `refine-control` | AI refinement |
+| `sync-control-evidence` | Evidence orchestration |
+| `make-extraction-callback` | External continuation |
+| `audit-worker` | Durable queue consumer |
+| `run-audit` | Audit entry point |
+| `rerun-audit` | Remediation |
+| `pace-controls` | Batch coordination |
+| `sweep-stuck-jobs` | Cleanup and recovery |
+
+## Data model
 
 | Domain | Tables |
 |---|---|
 | Reference | `tscs`, `prompts` |
-| Engagement | `engagements` (incl. `google_drive_id`, `evidence_folder_id`), `engagement_users` |
-| Domain | `controls`, `control_tscs`, `sample_tests` |
-| Pipeline | `evidence_files`, `evidence_control_links`, `extracted_evidence` |
+| Engagement | `engagements`, `engagement_users` |
+| Controls | `controls`, `control_tscs`, `sample_tests` |
+| Evidence | `evidence_files`, `evidence_control_links`, `extracted_evidence` |
 | Audit | `audit_runs`, `audit_results` |
-| Ops | `job_runs` |
+| Operations | `job_runs`, `audit_queue`, `evidence_sync_runs`, `external_extraction_jobs` |
 
-Extensions: `pgvector`, `pgcrypto`. Storage bucket: `evidence`. Every client-data table carries `engagement_id` (child tables labeled in `0005`) and has an `<table>_isolation` RLS policy (`0006`). A non-bypass `engagement_scoped` role (`0007`) is the identity those policies apply to — see the RLS section below.
+Private evidence objects use engagement/control-scoped Storage paths. Signed
+URLs are short-lived and generated only when required for controlled download
+or Airtable attachment display.
 
-## Migrations
+## Isolation model
 
-| | What |
+1. A per-engagement API key authenticates an engagement-scoped request.
+2. The request resolves one engagement ID.
+3. A direct Postgres transaction stamps
+   `app.current_engagement_id`.
+4. The transaction assumes the non-bypass `engagement_scoped` role.
+5. RLS policies restrict client tables to that engagement.
+
+System tables and system-wide workers use service-level access. Their entry
+points use separate system secrets and narrowly defined payloads.
+
+## Reliability boundaries
+
+| Boundary | Mechanism |
 |---|---|
-| `0001` | initial schema (13 tables, pgvector, pgcrypto, RLS enabled) |
-| `0002` | `job_runs` parent/child for async batch |
-| `0003` | `engagements.google_drive_id` + `evidence_folder_id` |
-| `0004` | drop `audit_results.conformity_level` |
-| `0005` | RLS **Label** — `engagement_id` on child tables + auto-fill triggers |
-| `0006` | RLS **Lock** — `<table>_isolation` policies |
-| `0007` | RLS **Restrict foundation** — `engagement_scoped` role |
+| Airtable's short automation runtime | Fast acknowledgements and background work |
+| Edge Function termination | Durable sync/queue rows and leases |
+| Duplicate triggers/callbacks | Hash dedupe, live-row constraints, idempotent callback |
+| Provider/network failures | Timeouts, bounded retry, actionable terminal status |
+| Large PDF duration | External Make.com processing |
+| Batch connection pressure | Global pacing and fair sharing |
+| Lost progress | `job_runs`, lifecycle tables, and scheduled sweeping |
 
-## AI model tiering
+## AI responsibilities
 
-- **Haiku** — extraction + refinement (cheap, high-volume).
-- **Opus** — audit judgment (the hardest reasoning; quality gate).
-- **Sonnet (temp 0)** — workpaper rendering (deterministic prose).
+- Claude Haiku-class models: control refinement and high-volume extraction.
+- Claude higher-reasoning model: audit judgment.
+- Claude rendering model: workpaper drafting.
+- OpenAI: evidence embeddings.
 
-## Auth model
+Model names and limits belong to versioned prompt rows, not architectural
+assumptions. Human review remains the final quality gate.
 
-Today: `verify_jwt=false`; `register-engagement` authenticates with the shared `AUDIT_SHARED_SECRET`, and every per-control function authenticates with a **per-engagement key** that also drives RLS enforcement (ADR-011). Phase 2: per-user JWT. See [SECURITY.md](./SECURITY.md).
+## Intentional limitations
 
-## RLS (multi-client isolation)
+- Airtable remains the frontend and requires separately published automation
+  scripts.
+- Prompts require a separate database activation step.
+- Current engagement keys identify a client, not an individual user.
+- Make.com handles initial-sync large PDFs, not remediation attachments.
+- The system has no automated cost-anomaly response or customer-facing rate
+  limiter.
 
-Mechanism: an RLS policy on each client table filters every query to `engagement_id = current_setting('app.current_engagement_id')`. The function sets that "badge" per request (**Stamp**) and connects as the non-bypass `engagement_scoped` role (**Restrict**), so the lock actually applies.
-
-**Status:** **LIVE end-to-end and adversarially proven.** Label + Lock + scoped role are shipped, and every client-data operation runs as `engagement_scoped` with the badge stamped per request via `withEngagementScope()` — one engagement's key cannot see another engagement's rows (proof harness: `supabase/tests/rls_isolation_proof.sql`). System tables (`prompts`, `job_runs`) intentionally remain on `service_role`. See [DECISIONS.md](./DECISIONS.md) ADR-008/ADR-011.
-
-## Storage + Vault
-
-Files: `evidence/{slug}/{control_id}/{filename}`; 24h signed URLs minted for Airtable attachments. Secrets in Vault, read via `Deno.env`; local mirror in gitignored `.env`.
-
-## Scalability (3 tiers)
-
-- **Prototype** — free tier, ~150s worker ceiling, client-side per-file orchestration for batches.
-- **Pilot (now)** — Supabase Pro, longer worker budget, in-platform coordinator + per-file fanout.
-- **Scale** — external durable queue (Inngest/Trigger.dev) for fanout, retries, per-tenant isolation at 20+ clients/month.
-
-## Known limitations
-
-- **30s Airtable script timeout** → fire-and-forget pattern (202 ack + background work).
-- **Engagement-wide runs are throughput-bounded by the DB connection pool** → the `pace-controls` coordinator launches controls in waves under a global cap, fair-shared across concurrently running engagements (ADR-014).
-- **~150s worker wall-clock** → long work self-chains into fresh invocations.
-- **`sb_publishable_*` aren't JWTs** → key-based auth instead.
-
-## Phase 2 backlog
-
-Per-user JWT auth · timing-safe secret compare + Vault rotation runbook · `temperature` column on `prompts` · external durable queue (Inngest/Trigger.dev) for fanout/retries at multi-client scale.
+Historical rationale is recorded in [DECISIONS.md](DECISIONS.md). Some early
+ADRs describe superseded implementation stages; later updates and this document
+represent the current design.

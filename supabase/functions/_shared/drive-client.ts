@@ -23,6 +23,10 @@ export interface DriveFile {
   id: string;
   name: string;
   mimeType: string;
+  // Bytes, when Drive reports it (absent for Google-native docs). Used by the
+  // evidence sync to serialize heavyweight files instead of loading several
+  // 100+ page reports into one worker's memory at once.
+  size?: number;
 }
 
 function b64url(input: string | ArrayBuffer): string {
@@ -112,13 +116,20 @@ export async function driveList(token: string, q: string): Promise<DriveFile[]> 
   url.searchParams.set("includeItemsFromAllDrives", "true");
   url.searchParams.set("corpora", "allDrives");
   url.searchParams.set("pageSize", "1000");
-  url.searchParams.set("fields", "files(id,name,mimeType)");
+  url.searchParams.set("fields", "files(id,name,mimeType,size)");
   const res = await fetchWithRetry(url, {
     headers: { Authorization: `Bearer ${token}` },
   }, { label: "drive list" });
   const data = await res.json();
   if (data.error) throw new Error(`Drive list failed: ${JSON.stringify(data.error)}`);
-  return (data.files ?? []) as DriveFile[];
+  // Drive reports size as a string (and omits it for Google-native docs).
+  return ((data.files ?? []) as { id: string; name: string; mimeType: string; size?: string }[])
+    .map((f) => ({
+      id: f.id,
+      name: f.name,
+      mimeType: f.mimeType,
+      size: f.size !== undefined ? Number(f.size) : undefined,
+    }));
 }
 
 // Download a Drive file's bytes by id. Shared-drive aware.

@@ -27,7 +27,7 @@ everything in budget it ticks the rest un-paced and reports `unpaced` > 0.
 > **This is only a stopgap.** Airtable's ~30s cap (and no `setTimeout`) means a
 > single run can't pace many controls to completion — it only spreads the initial
 > burst. For the real throttle use the `pace-controls` coordinator below. See
-> ADR-014.
+> ADR-014 / `docs/BATCH_TEST_01.md`.
 
 **Trigger:** an Airtable automation on the engagement table, *When a record
 matches conditions → `Run_All_V3_Audits` is checked*, running this script. The
@@ -113,6 +113,17 @@ small set — no extra control fields are needed since the control already exist
 - *Remediation flow also uses:* `additionalEvidence` (the attachments cell),
   `additionalNotes` (the long-text cell).
 
+## `sweep-stuck-jobs-script.js` — restart the Audit Overview's bad controls
+
+Fired from the Audit Overview row when an operator requests **Sweep stuck jobs**.
+It reads `[Failed_Jobs]` directly from the triggering Audit Overview record and
+sends those `control_uuid` values to the `sweep-stuck-jobs` function. The function writes progress to table
+`tblrb4PpeCCIShcnl`, field `💬`, resolves each control, and launches
+`sync-control-evidence`; sync starts the audit only after evidence is ready.
+
+**Input variables:** `supabaseKey`, `auditOverviewRecordId`, and optionally
+`functionsBaseUrl`. Do not configure a separate `badControlIds` input.
+
 ## Auth note
 
 The master script (`register-engagement`) uses the shared `auditSecret` — it's the
@@ -131,10 +142,8 @@ can still approach the cap for controls with many evidence files — if that bit
 in practice, that's the trigger to pull forward the async-queue ticket
 (ADR-006/007) and background sync the same way.
 
-## Auth note (ADR-011)
+## Current auth boundary (ADR-011)
 
-Today every call uses the single shared secret (`config.auditSecret`). After the
-RLS cutover, the per-control calls switch to sending that engagement's own
-`supabase_key` in the `x-audit-secret` header; `register-engagement` keeps using
-the shared secret (it's the setup call that mints the key). The per-control
-script has a marked line for that switch.
+`register-engagement` uses the shared setup secret. Per-control calls and the
+bad-control recovery mode use the engagement's own `supabaseKey`; the key both
+authenticates the call and limits it to that engagement.

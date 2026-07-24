@@ -143,7 +143,7 @@ Deno.test("fail-safe: a huge inflight (job_runs read error fallback) launches no
   assertEquals(plan.toLaunchIds.length, 0);
 });
 
-// --- Two-level cap: global + per-engagement fair share (two engagements running at once) ---
+// --- Two-level cap: global + per-engagement fair share (Batch Test 04 shape) ---
 
 Deno.test("fair share: two active engagements each get half the global cap", () => {
   // Kota + Gallium both pacing: ceil(8/2) = 4 slots each, NOT 8 each (which

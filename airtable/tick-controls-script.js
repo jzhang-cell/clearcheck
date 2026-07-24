@@ -2,10 +2,10 @@
 // its own per-control run (sync → refine → audit). Reference copy; Airtable runs
 // its own copy.
 //
-// ── STOPGAP THROTTLE (ADR-014) ────────────────────────────
+// ── STOPGAP THROTTLE (Batch Test 01 / ADR-014) ────────────────────────────
 // This is the IMMEDIATE, Airtable-only throttle. It paces the INITIAL burst so
 // the connection-heavy evidence-ingest phases don't all start at once and blow
-// the Postgres pooler (connection-pool exhaustion). It is NOT a complete throttle:
+// the Postgres pooler (see docs/BATCH_TEST_01.md). It is NOT a complete throttle:
 //   * Airtable's "Run a script" action is capped at ~30s and has NO setTimeout
 //     (we busy-wait), so a single run CANNOT pace many controls to completion —
 //     each control runs 30s–2min, far longer than any pause we can afford here.

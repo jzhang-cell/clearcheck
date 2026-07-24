@@ -126,7 +126,10 @@ Deno.serve(async (req: Request) => {
   // engagement is invisible at the DB → "not found" (RLS, not just a code check).
   let control: ControlRow;
   try {
-    control = await withEngagementScope(engagementId, (tx) => loadControl(tx, payload.control_uuid));
+    control = await withEngagementScope(
+      engagementId,
+      (tx) => loadControl(tx, payload.control_uuid),
+    );
   } catch (err) {
     return jsonResponse({ error: (err as Error).message }, 404);
   }
@@ -198,7 +201,7 @@ Deno.serve(async (req: Request) => {
       tableId: AIRTABLE_TABLE_ID,
       recordId: control.airtable_record_id,
       fields: {
-        V3_Refined_Expected_ControlDescription: refined.Suggested_Control_Description,
+        V3_Refined__Control_Description: refined.Suggested_Control_Description,
         V3_Refined_Expected_Procedure: refined.Refined_Expected_Procedure,
       },
     });

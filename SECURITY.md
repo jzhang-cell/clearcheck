@@ -1,53 +1,176 @@
-# ClearCheck V3 — Security
+# ClearCheck — Security Handover
 
-> Honest security posture. Multi-engagement isolation is **LIVE and adversarially proven** (2026-06-27) for the per-control functions; the remaining gaps are the two legacy `ingest-evidence` functions (being retired) and the deferred Phase-2 items below.
+This is an honest summary of the production security model and the controls the
+incoming owner must maintain. It is not a certification or substitute for a
+formal security review.
 
-## Secrets handling (Vault)
+## Data classification
 
-Four secrets, never hardcoded:
+ClearCheck processes client audit evidence, control descriptions, audit notes,
+and AI-generated conclusions. Treat all engagement content as confidential
+client data.
 
-| Secret | Used by |
+Do not use production evidence in local development unless the engagement owner
+has explicitly approved it and the local environment meets the same handling
+requirements.
+
+## Tenant isolation
+
+Engagement-scoped functions use:
+
+1. a unique per-engagement API key;
+2. key-to-engagement resolution;
+3. a transaction-local `app.current_engagement_id` database setting;
+4. the non-bypass `engagement_scoped` database role; and
+5. row-level security policies on client-data tables.
+
+This model was adversarially tested in production: one engagement's key could
+not read a control owned by another engagement.
+
+System tables and system-wide workers use service-level access and therefore
+require stricter entry-point and secret controls.
+
+## Authentication boundaries
+
+| Caller | Credential |
 |---|---|
-| `ANTHROPIC_API_KEY` | Claude calls (all functions) |
-| `OPENAI_API_KEY` | embeddings (ingest) |
-| `AUDIT_SHARED_SECRET` | `x-audit-secret` header check (all functions) |
-| `AIRTABLE_PAT` | Airtable write-backs |
+| Airtable engagement registration | `AUDIT_SHARED_SECRET` |
+| Airtable per-control operations | Per-engagement API key |
+| Scheduled cron and `audit-worker` | `AUDIT_SHARED_SECRET` |
+| ClearCheck to Make.com | `MAKE_WEBHOOK_SECRET` |
+| Make.com callback to ClearCheck | `MAKE_WEBHOOK_SECRET` |
 
-- **Cloud:** Supabase Vault, read via `Deno.env`. Production uses a **fresh** `AUDIT_SHARED_SECRET` — NOT the prototype's.
-- **Local:** `supabase/functions/.env` (gitignored).
-- **Service-account key** for Google Drive lives in `tmp/clearcheck-drive-sa.json` (gitignored, never committed). Rotate after any exposure.
+Edge Functions use `verify_jwt = false`; authentication occurs in each handler.
+The current pilot does not provide per-user identity or attribution for
+Airtable callers.
 
-## Data isolation (engagement scoping + RLS)
+## Secret inventory
 
-The multi-client isolation work follows **Label → Lock → Stamp → Restrict**:
+Secret values belong in Supabase function secrets or an approved password
+manager, never in Git.
 
-| Step | What | Status |
-|---|---|---|
-| **Label** | every client-data row carries `engagement_id` (migration `0005` added it to the 4 child tables + auto-fill triggers) | ✅ done |
-| **Lock** | one `<table>_isolation` RLS policy per client table — a row is visible only if its `engagement_id` matches the connection's badge `app.current_engagement_id` (or the logged-in user's engagements). Migration `0006`. | ✅ done + adversarially proven |
-| **Restrict foundation** | a non-bypass `engagement_scoped` role the locks apply to, granted only on client-data tables + `tscs`. Migration `0007`. | ✅ done + proven |
-| **Stamp + Restrict (in functions)** | the per-control functions (`register-control`, `refine-control`, `sync-control-evidence`, `run-audit`) authenticate with a per-engagement key and run client-data ops through `withEngagementScope()` on the non-bypass `engagement_scoped` role | ✅ **LIVE + adversarially proven (2026-06-27)** |
+| Name | Purpose |
+|---|---|
+| `ANTHROPIC_API_KEY` | Claude API |
+| `OPENAI_API_KEY` | Embeddings |
+| `AIRTABLE_PAT` | Airtable reads and writes |
+| `AUDIT_SHARED_SECRET` | System entry points |
+| `SUPABASE_DB_URL` | Scoped direct-Postgres connection |
+| `GOOGLE_SA_JSON` | Google service-account credential |
+| `GOOGLE_DRIVE_SUBJECT` | Delegated Google Workspace user |
+| `MAKE_LARGE_PDF_WEBHOOK_URL` | Make.com scenario endpoint |
+| `MAKE_WEBHOOK_SECRET` | Make request/callback authentication |
 
-**Status (2026-06-27): isolation is LIVE and adversarially proven in prod.** The per-control functions use per-engagement keys + `withEngagementScope()` (the non-bypass `engagement_scoped` role), so RLS filters every client-data query by `engagement_id`. **Verified live:** a control belonging to engagement B returns **HTTP 404** when called with engagement A's key, while B's own key gets past auth/scope (HTTP 400, not 404) — proving A cannot read B's data. `service_role` is now used only for system tables (prompts, job_runs, tscs). See [DECISIONS.md](./DECISIONS.md) ADR-008/011. **Last remaining `service_role` surface:** the two legacy `ingest-evidence` functions — being retired.
+Supabase injects its own URL and service credentials into Edge Functions.
 
-## Auth model (Phase 1 shared-secret)
+### Cron rotation trap
 
-- `verify_jwt = false` per function (`sb_publishable_*` keys aren't JWTs, so PostgREST JWT verification can't be used as-is).
-- Each handler calls `checkSharedSecret(req)` — compares the `x-audit-secret` header against `AUDIT_SHARED_SECRET`. Currently a plain string compare (no timing-safe compare yet).
-- No per-user identity in requests today — we can attribute an audit only to "someone with the secret."
+The sweeper's database cron reads `audit_shared_secret` from database Vault.
+Edge Functions read `AUDIT_SHARED_SECRET` from function secrets. These are
+separate copies.
+
+Whenever the system secret is rotated:
+
+1. update the Edge Function secret;
+2. update the database Vault copy;
+3. verify the next cron response is HTTP 200;
+4. verify Airtable registration; and
+5. record the rotation.
+
+## External-service access
+
+### Google Drive
+
+- Use read-only Drive scope.
+- Restrict delegated access to the approved Workspace subject.
+- Review domain-wide delegation periodically.
+- Rotate the service-account credential after suspected exposure.
+
+### Airtable
+
+- Give the PAT only the scopes and bases required for ClearCheck.
+- Restrict automation editing to approved owners.
+- Treat automation input variables containing keys as secrets.
+
+### Make.com
+
+- Require the shared Make secret on inbound and callback requests.
+- Restrict scenario and connection access.
+- Do not place Supabase service credentials in Make.
+- Use only scoped file URLs supplied by ClearCheck.
+- Review execution history because it can contain extracted client content.
+
+### AI providers
+
+- Use organization-controlled API accounts.
+- Enable billing and usage alerts.
+- Review provider data-retention and training settings under the applicable
+  contract.
+- Do not send more evidence than the workflow requires.
+
+## Storage and evidence links
+
+Evidence is stored in a private Supabase bucket. Airtable and Make.com receive
+scoped, time-limited file URLs when required. URLs must not be copied into
+long-lived public documents or tickets.
+
+Hashes and source identifiers support deduplication. A filename alone is not a
+security or identity boundary.
 
 ## Audit trail
 
-- **`job_runs`** — every function invocation: function name, status, payload, tokens/cost, `error_stack`.
-- **`audit_runs`** — per-control audit lifecycle, including the `evidence_synthesis` snapshot and `engagement_id`.
-- **`audit_results`** — the verdict, scratchpad reasoning, and rendered workpaper markdown.
+- `job_runs` records operational function activity.
+- `evidence_sync_runs` records initial evidence-sync lifecycle.
+- `external_extraction_jobs` records Make.com status and execution references.
+- `audit_queue` records durable handoff and retries.
+- `audit_runs` records each initial or remediation audit.
+- `audit_results` records the structured conclusion and workpaper.
 
-To reconstruct a failed audit: find the `job_runs` row → its `audit_run_id` → the `audit_results` row.
+Limit access to scratchpads, extracted evidence, and error payloads; they may
+contain sensitive client information.
 
-## Known gaps (read before pointing real client data at the system)
+## Access-review checklist
 
-- **RLS is enforced** in the per-control functions (per-engagement key + scoped role, adversarially proven 2026-06-27). The only remaining `service_role` surface is the two legacy `ingest-evidence` functions — being retired.
-- **`verify_jwt = false`** — auth is the shared secret alone; no per-user identity.
-- **Plain string secret compare** — no timing-safe compare (low risk at our volume, but auditors will flag it).
-- No rate limiting, no cost-spike anomaly detection, no DLP scan on evidence before Storage, no encryption-at-rest beyond Postgres defaults.
-- **Google Drive auto-pull** uses a service account; access is pending a Workspace Super Admin authorizing Domain-Wide Delegation (read-only `drive.readonly`). Until then the SA cannot read the Shared Drive.
+Review at handover and at least quarterly:
+
+- [ ] GitHub organization/repository administrators
+- [ ] Supabase project members
+- [ ] Airtable base owners and automation editors
+- [ ] Anthropic/OpenAI organization members and API keys
+- [ ] Google service accounts and domain-wide delegation
+- [ ] Make.com organization, scenario, connection, and webhook access
+- [ ] Password-manager vault membership
+- [ ] Billing contacts and alert recipients
+- [ ] Dormant or shared accounts
+
+## Incident-response minimum
+
+For suspected credential exposure:
+
+1. identify the affected credential and blast radius;
+2. disable or rotate it;
+3. update every required copy;
+4. review access and execution logs;
+5. determine which engagements and evidence were exposed;
+6. follow contractual notification requirements;
+7. test the repaired workflow; and
+8. document root cause and prevention.
+
+For suspected cross-engagement access, stop affected processing immediately and
+preserve logs before changing data.
+
+## Known gaps
+
+- No per-user identity or authorization for Airtable callers.
+- No customer-facing rate limiter.
+- No automated cost-spike anomaly response.
+- No DLP or malware scan before evidence enters Storage.
+- External providers process evidence under their own service controls.
+- Airtable and Make.com may retain execution inputs/outputs according to their
+  configured plans and policies.
+- AI output is probabilistic and requires human review.
+- The synchronized handover branch still requires review and acceptance before
+  it becomes the client-controlled release source.
+
+The incoming owner should assess these gaps against client contracts, privacy
+requirements, and the organization's risk appetite before expanding use.

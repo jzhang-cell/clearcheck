@@ -7,7 +7,13 @@
 // control_uuid extraction used to target the recovery 💬.
 
 import { assertEquals } from "jsr:@std/assert@^1";
-import { type JobRunRow, planSweep, recoveryStatus } from "./sweep-logic.ts";
+import {
+  type ExternalExtractionJobRow,
+  type JobRunRow,
+  planExternalSweep,
+  planSweep,
+  recoveryStatus,
+} from "./sweep-logic.ts";
 
 const NOW = Date.parse("2026-06-30T12:00:00.000Z");
 const minutesAgo = (m: number) => new Date(NOW - m * 60_000).toISOString();
@@ -94,4 +100,49 @@ Deno.test("recovery message tells the auditor re-running is safe for sync", () =
   const msg = recoveryStatus("sync-control-evidence", 12);
   assertEquals(msg.includes("Re-run"), true);
   assertEquals(msg.includes("skipped"), true);
+});
+
+function externalRow(over: Partial<ExternalExtractionJobRow>): ExternalExtractionJobRow {
+  return {
+    id: "external1",
+    sync_run_id: "sync1",
+    engagement_id: "eng1",
+    control_uuid: "ctrl1",
+    evidence_file_id: "file1",
+    filename: "report.pdf",
+    status: "processing",
+    updated_at: minutesAgo(130),
+    ...over,
+  };
+}
+
+Deno.test("sweeps a Make job only after the external stale threshold", () => {
+  const staleMs = 120 * 60_000;
+  assertEquals(
+    planExternalSweep({
+      rows: [externalRow({ updated_at: minutesAgo(130) })],
+      nowMs: NOW,
+      staleMs,
+    }).length,
+    1,
+  );
+  assertEquals(
+    planExternalSweep({
+      rows: [externalRow({ updated_at: minutesAgo(40) })],
+      nowMs: NOW,
+      staleMs,
+    }).length,
+    0,
+  );
+});
+
+Deno.test("external sweep ignores completed jobs and unreadable timestamps", () => {
+  const rows = [
+    externalRow({ id: "done", status: "completed" }),
+    externalRow({ id: "bad-time", updated_at: "not-a-date" }),
+  ];
+  assertEquals(
+    planExternalSweep({ rows, nowMs: NOW, staleMs: 120 * 60_000 }),
+    [],
+  );
 });

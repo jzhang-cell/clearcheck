@@ -1,6 +1,6 @@
 ---
 prompt_key: audit_remediation
-version: v3.0
+version: v3.1
 model: claude-opus-4-7
 max_tokens: 16384
 is_active: true
@@ -29,6 +29,7 @@ from {{attest_start}} to {{attest_end}}
 **NEW Auditor Notes:** {{additional_notes}}
 
 # SECTION 2 — CORE DIRECTIVES & STEP 1 ALIGNMENT
+- CONTROL ALIGNMENT: Always evaluate the NEW evidence and notes against the **Control Requirement** and **Expected Procedure** stated in SECTION 1. A delta only closes the prior gap if it satisfies what the control actually requires — do not accept new material that is responsive to the previous finding but off-target from the control itself.
 - ARRAY EVALUATION: Evaluate ALL `extracted_snippets` and `section_references` collectively.
 - ATTEST BOUNDARY: Evidence outside Attest Period fails UNLESS (a) previous gap erroneously flagged out-of-period activity, or (b) static artifact (policy/config/version table) within ±30 days of period.
 - LEVEL REFERENCES: All "Level 1/2/3" below refer to the initial audit's Rule 6 Evidence Hierarchy (CSV ≥95% / direct header match = Level 3; vendor URL inference / synonym match / UI temporal-failed = Level 2; hyperlink-only = Level 1).

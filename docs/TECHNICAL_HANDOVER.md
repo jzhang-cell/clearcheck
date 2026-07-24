@@ -1,257 +1,426 @@
-# SOC 2 ClearCheck — Technical Handover
+# ClearCheck — Technical Handover
 
-*For the engineer(s) taking over the system. Assumes general web/backend knowledge, not
-prior knowledge of this project.*
+This guide is for the engineer responsible for operating, maintaining, and
+deploying ClearCheck. It assumes general backend and cloud experience but no
+prior knowledge of the project.
 
----
+Read [HANDOVER.md](../HANDOVER.md) first for ownership and acceptance
+requirements.
 
-## 1. What the system does (one paragraph)
+## 1. Source-alignment status
 
-ClearCheck is an AI audit pipeline. An auditor ticks a checkbox in **Airtable**; that
-triggers a chain of **Supabase Edge Functions** (Deno/TypeScript) which pull a control's
-evidence from **Google Drive**, store it in **Supabase Storage**, use the **Claude API** to
-read the evidence and judge whether the control is met, then write the verdict and a formal
-write-up back into Airtable. Everything is logged to a `job_runs` table for observability.
+Production runs in Supabase project `kwuymtlpjkziqkumixvk`.
 
----
+The `codex/refine-handover-notes` review branch was synchronized from production
+source commit `052c55d`. The synchronization includes:
 
-## 2. Tech stack
+- `audit-worker` and the durable `audit_queue` handoff;
+- `make-extraction-callback`;
+- migrations `0015`–`0018`;
+- `evidence_sync_runs` and `external_extraction_jobs`;
+- Airtable `V3_Evidence` priority over Google Drive;
+- Make.com execution links and stale-job recovery;
+- final sweep verification; and
+- the latest refined-control field and prompt changes.
 
-| Piece | Role |
-|---|---|
-| **Supabase** | Postgres database, Edge Functions (Deno/TS), Storage (evidence files), Vault (secrets), Cron |
-| **Anthropic Claude** | Reading/extracting evidence (Haiku), judging conformity (Opus), writing the workpaper (Sonnet) |
-| **OpenAI** | Text embeddings (`text-embedding-3-small`) for evidence search |
-| **Airtable** | The auditor-facing UI — the controls grid, buttons, and result fields. Also holds small JavaScript "automation" scripts that call the edge functions. |
-| **Google Drive** | Where evidence files live (one folder per control). Pulled via a Google service account with domain-wide delegation. |
-| **Deno** | Runtime for the edge functions and the helper scripts. |
+The function, migration, prompt, Airtable, and helper-script trees match that
+production source. Do not deploy from the client repository until the draft PR
+is reviewed, merged, and tagged as the accepted handover release.
 
-**Environments** (check before any remote command with `cat supabase/.temp/project-ref`):
+## 2. System summary
 
-| Environment | Supabase project ref | Notes |
-|---|---|---|
-| Production | `kwuymtlpjkziqkumixvk` | The live system. |
-| Prototype / staging | `hfmhckntrkrllumlkzii` | Old dev project — do not touch unless doing local dev work. |
+ClearCheck is an asynchronous SOC 2 evidence-review pipeline:
 
----
-
-## 3. The end-to-end flow
-
-For one control, when the auditor ticks **Run V3 Audit**, an Airtable script runs these
-steps in order (each is an edge function):
-
-```
-register-control   → create/update the control + link its criteria (fast, synchronous)
-refine-control     → tidy the control's description + expected procedures (Haiku)
-sync-control-evidence → pull the Drive folder → Storage → read every file with Claude
-                       → attach files to the control → then triggers…
-run-audit          → judge conformity (Opus) → write the workpaper (Sonnet)
-                     → write the verdict + results back to Airtable
+```text
+Airtable trigger
+  → register/refine control
+  → select and store evidence
+  → extract/index evidence
+  → durable audit queue
+  → audit judgment + workpaper
+  → Supabase records + Airtable write-back
 ```
 
-A separate **re-run** flow (`rerun-audit`) lets an auditor re-check a control after adding
-new evidence or notes, without redoing everything.
+The auditor-facing interface is Airtable. Supabase owns workflow state,
+storage, isolation, queues, and scheduled recovery. AI providers perform
+extraction, judgment, and drafting. Make.com handles only configured large-PDF
+extraction.
 
-**Async design:** the slow steps (`sync-control-evidence`, `run-audit`) return a fast
-acknowledgement and keep working in the background, then write their own status into
-Airtable's `ClearCheck 💬` field. This is why an Airtable script (which has a ~30-second
-limit) never blocks on the slow work. Rule of thumb in the code: *the component doing the
-work is the component that writes the status.*
+## 3. Production services
 
----
-
-## 4. Edge functions (8)
-
-Located in `supabase/functions/`. All use `verify_jwt = false` (see `config.toml`) and log
-to `job_runs`.
-
-| Function | What it does |
-|---|---|
-| **register-engagement** | Creates/updates an engagement (a client audit), mints its per-engagement API key, stores the Airtable base id. Uses the shared secret (it runs before a per-engagement key exists). |
-| **register-control** | Creates/updates a control and links its Trust Services Criteria (TSCs). Returns the control's UUID. |
-| **refine-control** | Uses Haiku to clean up the control's description and expected procedures. |
-| **sync-control-evidence** | The heavy one. Finds the control's Drive folder, downloads each file, stores it, and reads it with Claude (`_shared/ingest-file.ts`). Handles big PDFs, self-chains for large folders, attaches files to the control, then triggers `run-audit`. |
-| **run-audit** | Loads the extracted evidence, judges conformity with Opus, renders the workpaper with Sonnet, and writes everything back to Airtable. |
-| **rerun-audit** | Remediation re-check: takes the previous verdict plus only the *new* evidence/notes and re-judges (uses the `audit_remediation` prompt). |
-| **pace-controls** | Coordinator that throttles how many controls run at once (so a "Run All" doesn't overwhelm the API). |
-| **sweep-stuck-jobs** | A scheduled (cron) cleanup that marks orphaned "running" job rows as failed, so the dashboard stays honest if a function was ever killed mid-run. |
-
-Shared code lives in `supabase/functions/_shared/` (~20 modules). Key ones:
-`ingest-file.ts` (the ingest pipeline), `extract-by-type.ts` (reads each file type with
-Claude), `claude-client.ts` / `openai-client.ts` (API clients with timeouts + retries),
-`scoped-db.ts` (per-engagement database access), `auth.ts` / `engagement-key.ts` (API-key
-auth), `airtable.ts` (write-backs), `drive-client.ts` (Google Drive), `job-run.ts` (logging).
-
----
-
-## 5. How evidence is read (the extraction pipeline)
-
-`sync-control-evidence` → `_shared/ingest-file.ts` → `_shared/extract-by-type.ts`. Each file
-is classified by type and read by a matching Claude prompt:
-
-- **CSV / spreadsheet** → `extractor_csv` (xlsx is converted to CSV first).
-- **Image** → `extractor_image`.
-- **Word doc** → `extractor_doc`.
-- **PDF ≤ 50 pages** → `extractor_pdf_small` (one Claude call).
-- **PDF > 50 pages ("large")** → split into **~10-page sections**, each read with the small-PDF
-  reader **in parallel**, then combined mechanically (no separate AI "aggregation" call).
-
-**Important tuning values** (in `extract-by-type.ts` / `sync-control-evidence.ts`, all
-env-overridable):
-
-| Setting | Value | Why it matters |
+| Service | Purpose | Ownership to confirm |
 |---|---|---|
-| `PDF_SECTION_PAGES` | 10 | Big PDFs are split into 10-page sections. Bigger sections = slower single calls. |
-| `PDF_CHUNK_CONCURRENCY` | 12 | How many sections/files read at once. |
-| `EXTRACT_TIMEOUT_MS` | 120000 | Per-Claude-call timeout. **Was 60s and caused big PDFs to fail** — a real section takes ~52–75s, so 60s aborted+retried+skipped them. Keep this comfortably above real call times. |
-| `PER_FILE_TIMEOUT_MS` | 150000 | Hard ceiling per file in the sync worker, so one hung file can't freeze a control. |
-| `SYNC_BUDGET_MS` | 50000 | After this, the function stops launching new files and re-invokes itself (self-chaining) to continue — so a huge folder finishes across several runs. |
+| Supabase | Postgres, Storage, Edge Functions, secrets, cron | Project admins, billing, incident contacts |
+| Airtable | Auditor UI and automation scripts | Base owners and automation editors |
+| Anthropic | Extraction, refinement, judgment, workpaper drafting | API key, billing, rate-limit tier |
+| OpenAI | Evidence embeddings | API key, billing, quota alerts |
+| Google Workspace | Drive evidence and service-account delegation | Workspace super admins |
+| Make.com | Large-PDF extraction scenario | Organization owner, scenario owner, connections |
+| GitHub | Source and release history | Repository admins and branch protection |
 
-> **Legacy note:** the old big-PDF approach used `extractor_pdf_chunk` + `extractor_pdf_aggregator`
-> (5-page chunks + an AI combine step). That combine step was too slow for 100+ page PDFs, so
-> the code now uses the section approach above. Those two prompts still exist in the DB but are
-> **no longer called** — safe to leave, or remove later.
+### Environments
 
----
+| Environment | Project reference | Rule |
+|---|---|---|
+| Production | `kwuymtlpjkziqkumixvk` | Confirm before every remote command |
+| Prototype | `hfmhckntrkrllumlkzii` | Historical; never use as a production target |
 
-## 6. Database
-
-Postgres on Supabase. Migrations in `supabase/migrations/` (0001 → 0014). Core tables:
-
-- **Reference:** `tscs` (the Trust Services Criteria), `prompts` (the AI prompts, loaded at runtime).
-- **Engagement:** `engagements`, `engagement_users`.
-- **Domain:** `controls`, `control_tscs`, `sample_tests`.
-- **Evidence pipeline:** `evidence_files`, `evidence_control_links`, `extracted_evidence`.
-- **Audit:** `audit_runs`, `audit_results`.
-- **Ops:** `job_runs` (every function call is logged here).
-
-Extensions: `pgvector` (embeddings), `pgcrypto`. Storage bucket: `evidence`.
-
-**Prompts live in the database**, not in code. The `.md` files in `supabase/prompts/` are the
-source; `scripts/sync-prompts.ts` upserts them into the `prompts` table. The functions load the
-active prompt at runtime (`loadActivePrompt`). To change a prompt's wording or `max_tokens`, edit
-the `.md` and re-sync (or update the row directly for a quick config fix).
-
----
-
-## 7. Security & multi-client isolation
-
-This is live in production (see `SECURITY.md` and `DECISIONS.md` ADR-011 for the full story):
-
-- **Row-Level Security (RLS)** is enabled on all tables. Each engagement's data is tagged with
-  its `engagement_id`, and a non-bypass database role (`engagement_scoped`) enforces that a
-  request can only see its own engagement's rows (`withEngagementScope()` in `scoped-db.ts`).
-- **Per-engagement API keys.** The per-control functions (`register-control`, `refine-control`,
-  `sync-control-evidence`, `run-audit`) require the calling engagement's own API key (SHA-256
-  hash stored in `engagements.api_key_hash`). This was adversarially tested: engagement A's key
-  gets HTTP 404 on engagement B's control.
-- **Secrets** (4) live in Supabase Vault: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-  `AUDIT_SHARED_SECRET`, `AIRTABLE_PAT`. Locally they live in `supabase/functions/.env`
-  (gitignored). **Never hardcode a secret.**
-
----
-
-## 8. The Airtable side
-
-The auditor UI is Airtable. The buttons run small JavaScript "automation" scripts (in the
-`airtable/` folder as reference copies) that call the edge functions:
-
-- `master-script.js` — kicks off an engagement (registers it).
-- `per-control-script.js` — the per-control run (register → refine → sync → audit chain).
-- `per-control-rerun-script.js` — the re-run / remediation flow.
-- `tick-controls-script.js` / `tick-controls-via-coordinator.js` — "run many controls" helpers.
-
-These scripts are pasted into Airtable Automations; the files here are the source of truth.
-Key result fields on a control: `ClearCheck 💬` (status + verdict), `V3_Conformity_Level`,
-`V3_Determination`, `V3_Briefing`, `V3_Results` (workpaper), `V3_Evidence` (attached files),
-`V3_Evidence_Count`, `V3_Run_At`, `V3_Cost_USD`.
-
----
-
-## 9. Deploying
+Check the linked target before a deployment:
 
 ```bash
-# 1. Point at production and confirm
-supabase link --project-ref kwuymtlpjkziqkumixvk
-cat supabase/.temp/project-ref          # confirm it says the prod ref
+cat supabase/.temp/project-ref
+git status -sb
+git log -1 --oneline
+```
 
-# 2. Apply any new database migrations
+## 4. End-to-end workflow
+
+### Initial audit
+
+1. Airtable calls `register-control`.
+2. Airtable calls `refine-control`.
+3. `sync-control-evidence` chooses the evidence source:
+   - if `V3_Evidence` contains attachments, it uses those attachments and
+     skips Google Drive;
+   - otherwise it reads the control's Google Drive subfolder.
+4. Each selected file is stored in the private Supabase `evidence` bucket and
+   hashed for deduplication.
+5. Ordinary files are extracted in Supabase. A PDF over 50 pages is sent to
+   Make.com when the external path is configured.
+6. Make.com returns the document-level extraction to
+   `make-extraction-callback`.
+7. When every file is ready, `sync-control-evidence` inserts a durable
+   `audit_queue` row.
+8. `audit-worker` claims that row and runs the shared audit pipeline.
+9. The audit pipeline creates `audit_runs` / `audit_results`, writes the
+   workpaper and result fields to Airtable, and marks the queue row done.
+
+The initial HTTP calls acknowledge quickly. Completion is represented by
+database state and the final Airtable message—not by the initial `202`.
+
+### Re-run modes
+
+`Re-run Audit 🤖` has two different behaviors:
+
+- **Run:** starts a fresh evidence sync and audit for the existing control.
+- **Run with Additional Evidence / Additional Notes:** runs a remediation pass
+  using the prior conclusion plus only the new attachments or notes.
+
+Remediation attachments currently use the local extractor path. The Make.com
+continuation belongs to the durable initial evidence-sync path.
+
+### Whole-engagement runs
+
+`pace-controls` launches controls in bounded waves. It gates on active
+evidence-sync work, applies a global cap, and fair-shares capacity across
+engagements. The Airtable coordinator script should call this function instead
+of ticking every control at once.
+
+## 5. Edge functions
+
+The complete production system contains ten functions:
+
+| Function | Authentication | Responsibility |
+|---|---|---|
+| `register-engagement` | Shared system secret | Upsert engagement, store Airtable/Drive identifiers, mint an engagement key |
+| `register-control` | Engagement key | Upsert control and TSC links |
+| `refine-control` | Engagement key | Refine control wording and expected procedures; write refined fields to Airtable |
+| `sync-control-evidence` | Engagement key | Select, store, extract, and finalize evidence; enqueue audit |
+| `make-extraction-callback` | Make callback secret | Complete or fail an external large-PDF job and resume its sync |
+| `audit-worker` | Shared system secret | Claim durable audit jobs and run the audit pipeline |
+| `run-audit` | Engagement key | Direct entry point to the shared audit pipeline |
+| `rerun-audit` | Engagement key | Reassess a prior result using new evidence or notes |
+| `pace-controls` | Engagement key | Pace engagement-wide launches |
+| `sweep-stuck-jobs` | Shared secret or engagement key, by mode | Clean stale work and recover selected controls |
+
+All functions use `verify_jwt = false`; authorization is enforced in the
+handler. Client-data access then runs through the scoped database role so RLS
+applies.
+
+## 6. Durable state and source of truth
+
+| Table | Purpose |
+|---|---|
+| `job_runs` | Operational log for function work |
+| `evidence_sync_runs` | One durable initial evidence-sync lifecycle |
+| `external_extraction_jobs` | Make.com jobs, callbacks, errors, and execution URLs |
+| `audit_queue` | Durable sync-to-audit handoff with retries and leases |
+| `audit_runs` | Audit/remediation lifecycle and evidence snapshot |
+| `audit_results` | Final structured conclusion and rendered workpaper |
+| `evidence_files` | Stored-file identity, hash, status, and metadata |
+| `extracted_evidence` | Structured extraction and embedding |
+| `evidence_control_links` | Evidence-to-control relationship |
+| `controls` | Current control state and latest audit pointer |
+| `prompts` | Versioned runtime AI configuration |
+
+Airtable is the user interface, not the workflow source of truth. Diagnose a
+problem from Supabase first, then compare the Airtable write-back.
+
+The complete production schema currently includes migrations through `0018`.
+Migrations are forward-only. Never edit a migration that has already been
+applied; add a new migration.
+
+## 7. Evidence extraction
+
+| File type | Normal path |
+|---|---|
+| CSV / spreadsheet | Convert if needed, then `extractor_csv` |
+| Image | `extractor_image` |
+| Word document | `extractor_doc` |
+| PDF up to 50 pages | `extractor_pdf_small` |
+| PDF over 50 pages | Make.com Stage 1 chunks + Stage 2 aggregation, when configured |
+
+Supabase always retains responsibility for file identity, Storage, hashing,
+deduplication, embeddings, database writes, Airtable mirroring, and audit
+enqueueing. Make.com must not write ClearCheck tables or start audits.
+
+The Make callback is idempotent. Its payload includes the job ID, completion
+status, structured extraction, token counts, Make execution ID, and a direct
+execution URL for debugging.
+
+## 8. Prompts and models
+
+Prompt Markdown in `supabase/prompts/` is the version-controlled source. Runtime
+functions load the active row from the `prompts` table.
+
+Therefore:
+
+- editing a prompt file does not change production;
+- syncing a prompt changes production without redeploying the function;
+- each meaningful change should use a new prompt version;
+- sync only the intended prompt when possible; and
+- verify that exactly one row for the prompt key is active.
+
+`control_refiner` v3.3 requires expected procedures to use past-tense
+audit-performance wording such as “Inquired” and “Inspected.” The Airtable
+write-back target for the refined control description is
+`V3_Refined__Control_Description`.
+
+## 9. Authentication, isolation, and secrets
+
+### Authentication boundaries
+
+- `register-engagement`, cron, and `audit-worker` use
+  `AUDIT_SHARED_SECRET`.
+- Engagement-scoped functions use a per-engagement API key. The key identifies
+  the engagement and limits the blast radius of exposure.
+- `make-extraction-callback` uses `MAKE_WEBHOOK_SECRET`.
+- Client data is queried as the non-bypass `engagement_scoped` database role
+  with `app.current_engagement_id` stamped per transaction.
+
+### Required production configuration
+
+Confirm these through `supabase secrets list` and the approved password manager.
+Do not place secret values in tickets, chat, documentation, shell history, or
+Git.
+
+| Name | Sensitivity | Purpose |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Secret | Claude requests |
+| `OPENAI_API_KEY` | Secret | Embeddings |
+| `AIRTABLE_PAT` | Secret | Airtable reads and write-backs |
+| `AUDIT_SHARED_SECRET` | Secret | System-function authentication |
+| `SUPABASE_DB_URL` | Secret | Scoped direct-Postgres connection |
+| `GOOGLE_SA_JSON` | Secret | Google service-account credentials |
+| `GOOGLE_DRIVE_SUBJECT` | Configuration | Delegated Google Workspace subject |
+| `MAKE_LARGE_PDF_WEBHOOK_URL` | Sensitive configuration | Make.com inbound webhook |
+| `MAKE_WEBHOOK_SECRET` | Secret | Make request/callback authentication |
+
+Supabase automatically injects its URL and service-role credentials into Edge
+Functions.
+
+### Cron-secret duplication
+
+The scheduled sweeper reads `audit_shared_secret` from database Vault, while
+Edge Functions read `AUDIT_SHARED_SECRET` from function secrets. Rotating one
+does not rotate the other. Update and test both copies whenever the system
+secret changes.
+
+## 10. Airtable deployment boundary
+
+The files under `airtable/` are reference copies. Airtable runs its own pasted
+copies inside automations.
+
+After any Airtable-script change:
+
+1. update and review the repository file;
+2. paste that exact version into the intended Airtable automation;
+3. verify all automation input variables;
+4. run a test record; and
+5. record who changed the live automation and when.
+
+Relevant fields include:
+
+- `ClearCheck 💬`
+- `V3_Evidence`
+- `V3_Conformity_Level`
+- `V3_Determination`
+- `V3_Briefing`
+- `V3_Results`
+- `V3_Done_At`
+- `V3_Cost_USD`
+- `V3_Refined__Control_Description`
+- `V3_Refined_Expected_Procedure`
+
+The shared Airtable PATCH helper retries after removing unknown optional fields,
+but required schema changes still need coordinated testing.
+
+## 11. Safe deployment procedure
+
+### Before changing production
+
+```bash
+git status -sb
+git fetch origin
+cat supabase/.temp/project-ref
+supabase functions list
+supabase migration list
+```
+
+Then:
+
+1. work on a branch and review the diff;
+2. run type checks and the relevant tests;
+3. confirm the target project is production;
+4. apply migrations before code that depends on them;
+5. sync only changed prompts;
+6. deploy only affected functions; and
+7. perform a focused smoke test.
+
+Example:
+
+```bash
+supabase db push --dry-run
 supabase db push
 
-# 3. Sync prompts (if any .md changed)
-deno run -A scripts/sync-prompts.ts     # needs SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY env for prod
+PROMPT_KEY=control_refiner \
+deno run --allow-read --allow-env --allow-net scripts/sync-prompts.ts
 
-# 4. Deploy functions (one, several, or all)
-supabase functions deploy sync-control-evidence run-audit rerun-audit …
-
-# 5. Secrets (only when they change)
-supabase secrets set ANTHROPIC_API_KEY=… OPENAI_API_KEY=… AUDIT_SHARED_SECRET=… AIRTABLE_PAT=…
+supabase functions deploy refine-control --use-api
+supabase functions list
 ```
 
-Prompts are read from the DB at runtime, so a prompt/`max_tokens` change takes effect
-**without** a function redeploy.
+Use credentials supplied by the approved secret-management process. Do not put
+real values into a committed command example.
 
----
+### Rollback
 
-## 10. Local development
+- **Function:** redeploy the last known-good commit.
+- **Prompt:** reactivate the prior prompt version and verify one active row.
+- **Airtable script:** restore the last reviewed reference copy.
+- **Database:** use a new corrective migration; do not rewrite applied history.
 
-```bash
-supabase start                                   # local Postgres + Storage (needs Docker/OrbStack)
-# create supabase/functions/.env with ANTHROPIC_API_KEY, OPENAI_API_KEY, AUDIT_SHARED_SECRET
-supabase functions serve --env-file supabase/functions/.env --no-verify-jwt
-```
+## 12. Monitoring
 
-Without `AIRTABLE_PAT`, local runs skip the Airtable write-back (they still do the real work).
-Type-check a function before deploying: `deno check supabase/functions/<name>/index.ts`.
-
-> There are two known, harmless type-check warnings (a `tx.json()` JSONValue mismatch in
-> `ingest-file.ts` and a `setTimeout` `Timeout`-vs-`number` in `sync-control-evidence.ts`). They
-> don't affect runtime and the deploy bundles past them.
-
----
-
-## 11. Operating & troubleshooting
-
-Everything is logged to **`job_runs`** (function name, status, payload, error, duration,
-timestamps). To see what happened, query it:
+### Recent function work
 
 ```sql
--- recent activity for one engagement
-select function_name, status, started_at, duration_ms, error_message
-from job_runs j join engagements e on e.id = j.engagement_id
-where e.airtable_base = '<airtable base id>'
-order by started_at desc limit 30;
+select function_name, status, engagement_id, started_at, completed_at,
+       error_message, result
+from job_runs
+order by started_at desc
+limit 100;
 ```
 
-Common things to check:
+### Evidence and Make.com
 
-- **A control seems stuck** → look for a `job_runs` row still `running`. A sync/audit call can
-  only live a couple of minutes; anything "running" for longer is an orphan (function was killed).
-  `sweep-stuck-jobs` cleans these up automatically; you can also mark them failed by hand.
-- **A file didn't extract** → check the `evidence_files` row's `status` and `error_message`, and
-  whether it has an `extracted_evidence` row.
-- **"1 file failed" on a big PDF** → almost always the extraction is slower than a timeout. See the
-  tuning table in Section 5 (`EXTRACT_TIMEOUT_MS`).
-- **Live logs** → the Supabase dashboard → Edge Functions → Logs, or `supabase functions logs <name>`.
+```sql
+select id, control_uuid, status, total_files, error_message,
+       created_at, completed_at
+from evidence_sync_runs
+order by created_at desc
+limit 30;
 
----
+select id, sync_run_id, filename, status, provider_execution_id,
+       provider_execution_url, error_message, updated_at
+from external_extraction_jobs
+order by queued_at desc
+limit 50;
+```
 
-## 12. Where to read more (internal repo docs)
+### Audit queue
 
-- `ARCHITECTURE.md` — deeper system design, data flow, RLS, scaling.
-- `SECURITY.md` — full security posture and known gaps.
-- `RUNBOOK.md` — operational procedures.
-- `DECISIONS.md` — architecture decision records (why things are the way they are).
-- `docs/USER_GUIDE.md` — exactly what the auditor sees and does, step by step.
+```sql
+select id, control_uuid, status, attempts, visible_at,
+       lease_expires_at, last_error, enqueued_at
+from audit_queue
+order by enqueued_at desc
+limit 50;
+```
 
----
+### Sweeper health
 
-## 13. Handover checklist for the new owner
+```sql
+select jobname, schedule, active
+from cron.job
+where jobname = 'sweep-stuck-jobs';
 
-- [ ] Get access to: the Supabase project (`kwuymtlpjkziqkumixvk`), the Anthropic + OpenAI
-      accounts, the Airtable base, and the Google Workspace service account.
-- [ ] Confirm the 4 secrets are set in Supabase Vault.
-- [ ] Rotate any secrets that were shared during development.
-- [ ] Check the **Anthropic API rate-limit tier** — with lots of parallel extraction, a low
-      tier can slow big jobs down. (This bit us during development; higher tier = faster.)
-- [ ] Do one end-to-end test run on a non-production/test engagement before relying on it.
+select status_code, created
+from net._http_response
+order by created desc
+limit 10;
+```
+
+Expected successful cron calls return HTTP 200 every five minutes.
+
+## 13. Troubleshooting order
+
+Use this sequence rather than relying only on the Airtable message:
+
+1. Identify the engagement and Supabase control UUID.
+2. Read the latest relevant `job_runs`.
+3. Check the exact `evidence_sync_runs` row.
+4. If external, inspect `external_extraction_jobs` and open its Make execution
+   URL.
+5. Check `audit_queue`, then `audit_runs` and `audit_results`.
+6. Inspect the job's `result.airtable_sync`.
+7. Only then compare the Airtable fields.
+
+| Symptom | First checks | Normal recovery |
+|---|---|---|
+| Evidence status is frozen | `evidence_sync_runs`, file statuses, latest sync job | Use full **Run** or selected-control sweep after confirming no live work |
+| Large PDF waits too long | External job status, `updated_at`, Make execution URL | Fix Make failure or allow sweeper to close stale job, then run again |
+| Evidence is complete but no audit starts | `audit_queue`, `audit-worker` jobs | Repair queue/worker issue; do not start audit before evidence completion |
+| Audit completed but Airtable is stale | `job_runs.result.airtable_sync`, Airtable field names | Correct Airtable schema/token and retry write-back or rerun |
+| Cron returns 401 | Function secret versus database Vault copy | Update both copies and verify the next cron response |
+| Whole engagement stops launching | Stale running jobs and pacer result | Run cleanup/sweep, then restart pacing |
+
+## 14. Recovery semantics
+
+The selected-control sweep:
+
+1. marks stale jobs failed;
+2. restarts evidence sync for each selected control;
+3. records the exact sync IDs;
+4. waits for sync, audit, worker, and Airtable write-back completion; and
+5. writes a green Audit Overview message only after every selected control
+   passes all checks.
+
+An initial “started” response is not proof of completion.
+
+## 15. Known limitations and risks
+
+- AI results require human review and are not deterministic.
+- Airtable is not a transactional workflow engine; its displayed state can lag
+  Supabase.
+- Airtable scripts and database prompts require separate publication steps.
+- Per-engagement keys do not provide per-user attribution.
+- The system has no customer-facing rate limiter or automated cost-anomaly
+  detection.
+- Large-PDF reliability depends on Make.com and its connected PDF/AI services.
+- Make.com external extraction is not yet used for remediation attachments.
+- The synchronized review branch must be approved and merged before the client
+  repository becomes the release source of truth.
+
+## 16. Acceptance
+
+Complete the master checklist in [HANDOVER.md](../HANDOVER.md), then record:
+
+- accepted production commit/tag;
+- deployed function versions;
+- latest applied migration;
+- active prompt versions;
+- Airtable automation versions;
+- Make.com scenario version;
+- service owners and incident contacts; and
+- handover acceptance date.

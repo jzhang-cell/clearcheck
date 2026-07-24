@@ -5,7 +5,7 @@
 // ticking every control here (bounded by Airtable's ~30s cap, no setTimeout),
 // it makes ONE fast call to the server-side `pace-controls` coordinator, which
 // launches controls in paced waves — keeping in-flight connection-heavy jobs
-// under a cap so the Postgres pooler isn't exhausted.
+// under a cap so the Postgres pooler isn't exhausted (see docs/BATCH_TEST_01.md).
 // The coordinator has no 30s cap and self-chains until every control is launched.
 //
 // Use this once `pace-controls` is deployed. Until then, keep using
