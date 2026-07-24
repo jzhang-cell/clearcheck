@@ -8,6 +8,10 @@ manual reading into minutes of review.
 The auditor works entirely from a simple **Airtable** screen: tick a box to run a control,
 watch the progress, and read the result — no code or technical steps needed.
 
+> **Handover status:** production is live, but this repository has not yet been
+> synchronized with the complete production source. Do not deploy it until the
+> source-alignment checklist in [HANDOVER.md](./HANDOVER.md) is complete.
+
 ## Where to start
 
 | If you are… | Read this |
@@ -18,9 +22,10 @@ watch the progress, and read the result — no code or technical steps needed.
 
 ## How it works, in one line
 
-An auditor ticks **Run V3 Audit** in Airtable → the system registers the control, pulls its
-evidence from Google Drive and reads it with AI, judges whether the control is met and writes up
-the finding → the verdict appears back in Airtable for review.
+An auditor ticks **Run V3 Audit** in Airtable → ClearCheck uses Airtable
+`V3_Evidence` attachments when present, otherwise pulls Google Drive evidence →
+ordinary files are processed in Supabase and large PDFs can be offloaded to
+Make.com → the audit is queued, judged, and written back to Airtable for review.
 
 ## Stack
 
@@ -30,7 +35,8 @@ the finding → the verdict appears back in Airtable for review.
 | **Anthropic Claude** | Reading evidence, judging conformity, writing the workpaper |
 | **OpenAI** | Embeddings for evidence search |
 | **Airtable** | The auditor-facing frontend (controls grid, buttons, result fields) |
-| **Google Drive** | Source of the evidence files (one folder per control) |
+| **Google Drive** | Fallback evidence source when `V3_Evidence` is empty |
+| **Make.com** | External extraction for configured large PDFs |
 
 ## Repository layout
 
@@ -52,3 +58,7 @@ the finding → the verdict appears back in Airtable for review.
 - [RUNBOOK.md](./RUNBOOK.md) — operational guide for auditors and ops
 - [SECURITY.md](./SECURITY.md) — secrets, auth, per-client isolation, audit trail
 - [DECISIONS.md](./DECISIONS.md) — architecture decision records
+
+The handover-facing documents describe the live production design. The source
+files in this repository must be synchronized before this repository becomes
+the deployable release source of truth.

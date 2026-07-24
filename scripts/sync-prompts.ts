@@ -11,10 +11,12 @@
 //
 // Usage:
 //   deno run --allow-read --allow-env --allow-net scripts/sync-prompts.ts
+//   PROMPT_KEY=control_refiner deno run --allow-read --allow-env --allow-net scripts/sync-prompts.ts
 //
 // Env (override to target cloud):
 //   SUPABASE_URL              defaults to http://127.0.0.1:54321 (local stack)
 //   SUPABASE_SERVICE_ROLE_KEY defaults to the standard local-dev key
+//   PROMPT_KEY                optional: sync only this prompt_key
 
 import { parse as parseYaml } from "@std/yaml";
 import { createClient } from "npm:@supabase/supabase-js@^2";
@@ -28,6 +30,7 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "http://127.0.0.1:54321";
 const LOCAL_DEV_SERVICE_ROLE_KEY =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU";
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? LOCAL_DEV_SERVICE_ROLE_KEY;
+const ONLY_PROMPT_KEY = Deno.env.get("PROMPT_KEY")?.trim() || null;
 
 interface Frontmatter {
   prompt_key?: string;
@@ -91,6 +94,7 @@ async function main() {
   const isLocalKey = SERVICE_ROLE_KEY === LOCAL_DEV_SERVICE_ROLE_KEY;
   console.log(`Found ${files.length} prompt file(s) in ${PROMPTS_DIR}`);
   console.log(`URL: ${SUPABASE_URL}  (key: ${isLocalKey ? "local-dev default" : "from env"})\n`);
+  if (ONLY_PROMPT_KEY) console.log(`Filter: prompt_key=${ONLY_PROMPT_KEY}\n`);
 
   const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
     auth: { persistSession: false, autoRefreshToken: false },
@@ -104,6 +108,7 @@ async function main() {
     try {
       const content = await Deno.readTextFile(path);
       const p = parsePromptFile(content, filename);
+      if (ONLY_PROMPT_KEY && p.prompt_key !== ONLY_PROMPT_KEY) continue;
 
       // Step 1: deactivate any prior active row(s) for this prompt_key.
       const { error: deactErr } = await supabase
@@ -142,7 +147,7 @@ async function main() {
   }
 
   console.log(`\nSynced ${synced}/${files.length}. Errors: ${errors}`);
-  if (errors > 0) Deno.exit(1);
+  if (errors > 0 || (ONLY_PROMPT_KEY && synced === 0)) Deno.exit(1);
 }
 
 await main();

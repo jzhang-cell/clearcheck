@@ -48,21 +48,28 @@ The important columns you'll use:
 
 ---
 
-## 3. Before you start: put the evidence in place
+## 3. Before you start: choose the evidence source
 
-ClearCheck reads evidence from a **Google Drive folder** — one folder per control, named
-with the control's code (for example, a folder starting with `CC.06.05-…`).
+ClearCheck supports two evidence sources. It checks them in this order:
 
-**So before running a control, make sure that control's evidence files are in its Google
-Drive folder.** ClearCheck can read:
+1. **`V3_Evidence` attachments in Airtable.** When this field is not empty,
+   ClearCheck uses these attachments and does not pull the Google Drive folder.
+2. **Google Drive.** When `V3_Evidence` is empty, ClearCheck uses the control's
+   Drive folder, named with the control code (for example `CC.06.05-…`).
+
+Before running the control, confirm that the intended source contains the
+complete evidence set. If `V3_Evidence` has old attachments, clear or replace
+them before expecting ClearCheck to use Drive.
+
+ClearCheck can read:
 
 - PDFs (including long, many-page ones)
 - Spreadsheets / CSV files
 - Images and screenshots (PNG, JPG)
 - Word documents
 
-It **cannot** read a **ZIP** file — if evidence is zipped, unzip it and upload the real
-files. ClearCheck will tell you if it finds a zip.
+It cannot read inside a ZIP file. Unzip the archive and attach or upload the
+individual files before starting the audit.
 
 ---
 
@@ -77,8 +84,9 @@ files. ClearCheck will tell you if it finds a zip.
 |---|---|
 | 🤓 Reading control details… | Getting the control ready. |
 | ⏳ Polishing control description… | Tidying up the control's wording. |
-| 🔎 Pulling evidence from Google Drive… | Fetching the evidence files. |
+| 🔎 Pulling evidence… | Fetching the Airtable attachments or Google Drive files selected for this run. |
 | 📄 Reading your evidence… 🟩🟩🟩⬜⬜⬜ 3 of 9 files | Reading each file (the bar fills up as it goes). |
+| ☁️ Make is reading a large PDF… | A long PDF is being processed externally; this can take longer than ordinary files. |
 | ✅ Evidence read — starting the audit… | Done reading; the audit is beginning. |
 | 🧠 ClearCheck is auditing the evidence | The AI is making its judgment (the main step). |
 | 🥳 Audit complete — No Deviation | **Finished!** The verdict is shown right here. |
@@ -129,8 +137,10 @@ On the same control row:
 3. ClearCheck re-checks the control, taking your new input into account, and updates the
    verdict.
 
-A re-run only looks at what changed — it doesn't re-do the whole audit from scratch — so
-it's quick and doesn't waste effort.
+The **Additional Evidence** and **Additional Notes** options are remediation
+passes: they reuse the prior conclusion and focus on the new material. The
+plain **Run** option is different—it performs a fresh evidence sync and audit
+for the existing control.
 
 ---
 
@@ -141,10 +151,11 @@ ClearCheck always tells you **what went wrong and what to do** — it won't just
 
 | Message | What to do |
 |---|---|
-| 📁 No evidence found for `<control>` — please upload the evidence into the Additional Evidence field and re-run. | The control's Google Drive folder is missing or empty. Add the evidence and re-run. |
-| 📭 Evidence folder is empty | Add the evidence files to that control's Drive folder, then re-run. |
-| 📦 Only zip file(s) found | Unzip the evidence in Google Drive and re-run — ClearCheck can't read inside a zip. |
+| 📁 No evidence found for `<control>` | Add evidence to `V3_Evidence` or the control's Google Drive folder, then use **Run**. |
+| 📭 Evidence folder is empty | Confirm the intended Airtable or Drive source contains files, then use **Run**. |
+| 📦 Only zip file(s) found | Unzip the evidence, attach or upload the individual files, then run again. |
 | ✅ Evidence ready (3 files). ⚠️ 1 file failed. | Most files were read; one couldn't be. Check that one file and re-run if it matters. |
+| ⚠️ Large-PDF extraction timed out | Tell the technical owner and provide the control code; they can open the saved Make.com execution link. |
 | ❌ Audit failed | Something went wrong during the audit. Try again; if it keeps happening, tell your technical contact. |
 
 ---
@@ -167,7 +178,9 @@ ClearCheck always tells you **what went wrong and what to do** — it won't just
 No. It works in the background. You can close the tab and check back later.
 
 **How long does one control take?**
-Usually about a minute or two, depending on how many (and how large) the evidence files are.
+Small evidence sets often finish in a few minutes. Large folders and long PDFs
+can take considerably longer. Watch `ClearCheck 💬`; do not start a duplicate
+run only because the browser appears idle.
 
 **Can it read a 100-page PDF?**
 Yes. Large PDFs take a little longer but are handled automatically.
@@ -176,5 +189,7 @@ Yes. Large PDFs take a little longer but are handled automatically.
 Add evidence or notes and use **Re-run Audit 🤖** (Section 6). You always have the final say.
 
 **Is my data safe?**
-Yes. Each client engagement is kept separate, and every action is logged. Your technical
-contact can share the security details.
+ClearCheck is designed to keep engagements separate and log system activity.
+Access still depends on correctly managed Airtable, Supabase, Google, Make.com,
+and AI-provider accounts. Ask the technical owner for the current security
+review if you need assurance for a specific engagement.
