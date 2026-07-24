@@ -8,9 +8,9 @@ manual reading into minutes of review.
 The auditor works entirely from a simple **Airtable** screen: tick a box to run a control,
 watch the progress, and read the result — no code or technical steps needed.
 
-> **Handover status:** production is live, but this repository has not yet been
-> synchronized with the complete production source. Do not deploy it until the
-> source-alignment checklist in [HANDOVER.md](./HANDOVER.md) is complete.
+> **Handover status:** production source commit `052c55d` has been synchronized
+> onto the handover review branch. Do not deploy from the client repository
+> until that draft PR is reviewed, merged, and recorded as the accepted release.
 
 ## Where to start
 
@@ -59,6 +59,6 @@ Make.com → the audit is queued, judged, and written back to Airtable for revie
 - [SECURITY.md](./SECURITY.md) — secrets, auth, per-client isolation, audit trail
 - [DECISIONS.md](./DECISIONS.md) — architecture decision records
 
-The handover-facing documents describe the live production design. The source
-files in this repository must be synchronized before this repository becomes
-the deployable release source of truth.
+The handover-facing documents describe the live production design. Complete the
+acceptance checklist before treating the merged client repository as the
+deployable release source of truth.

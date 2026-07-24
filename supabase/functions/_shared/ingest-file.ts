@@ -1,4 +1,4 @@
-import { startJobRun, completeJobRun, failJobRun } from "./job-run.ts";
+import { completeJobRun, failJobRun, startJobRun } from "./job-run.ts";
 import { withEngagementScope } from "./scoped-db.ts";
 import type { Sql } from "./scoped-db.ts";
 import { detectFileType, mimeTypeFor, primaryPromptKeyFor } from "./file-type.ts";
@@ -7,6 +7,7 @@ import { extractByType } from "./extract-by-type.ts";
 import { xlsxToCsv } from "./xlsx-to-csv.ts";
 import { loadActivePrompt } from "./load-prompt.ts";
 import { generateEmbedding } from "./openai-client.ts";
+import { dispatchMakeExtraction, shouldUseMakeExtraction } from "./external-extraction.ts";
 
 const FUNCTION_NAME = "ingest-evidence";
 
@@ -16,23 +17,34 @@ export interface IngestFileArgs {
   file_path: string; // storage path used for storage_path column
   filename: string;
   file_bytes: Uint8Array;
+  // Original Drive object. Make uses this ID with its own Google Drive
+  // connection.
+  google_drive_file_id?: string;
+  // Airtable evidence has no Drive ID. sync-control-evidence supplies a
+  // time-limited URL for the already-uploaded Storage object so Make can fetch
+  // a large PDF without receiving a Supabase service credential.
+  external_download_url?: string;
   trigger_source?: string; // 'manual' | 'batch' | webhook source — caller decides
+  // Present when sync-control-evidence owns the orchestration. It lets a large
+  // PDF return "queued" and resume the same sync after Make calls back.
+  sync_run_id?: string;
 }
 
 export interface IngestFileResult {
-  status: "extracted" | "skipped" | "failed";
+  status: "extracted" | "skipped" | "queued" | "failed";
   filename: string;
   evidence_file_id: string | null;
   extracted_evidence_id?: string;
   skip_reason?: "file_dedupe" | "extraction_dedupe";
   existing_file_id?: string;
   existing_extraction_id?: string;
+  external_job_id?: string;
   job_run_id: string | null; // null only if startJobRun itself failed
   duration_ms: number;
   tokens?: { input: number; output: number; embedding: number };
   error?: string;
   // Evidence Log write-back fields — populated on extracted/skipped, absent on hard failure
-  file_type?: string;        // FileType value, e.g. "pdf_small", "csv", "image", "doc"
+  file_type?: string; // FileType value, e.g. "pdf_small", "csv", "image", "doc"
   file_size_bytes?: number;
   storage_path?: string;
   extracted_summary?: string; // document_summary from extracted_content, or truncated JSON
@@ -113,7 +125,11 @@ async function findExistingExtraction(
   return rows[0] ?? null;
 }
 
-async function linkFileToControl(tx: Sql, evidenceFileId: string, controlId: string): Promise<void> {
+async function linkFileToControl(
+  tx: Sql,
+  evidenceFileId: string,
+  controlId: string,
+): Promise<void> {
   // The trg_evidence_control_links_engagement trigger auto-derives engagement_id
   // from the controls parent, so we omit it here.
   await tx`
@@ -215,6 +231,8 @@ export async function ingestFile(args: IngestFileArgs): Promise<IngestFileResult
         control_id: args.control_id,
         file_path: args.file_path,
         filename: args.filename,
+        google_drive_file_id: args.google_drive_file_id,
+        sync_run_id: args.sync_run_id,
       },
       engagement_id: engagementId,
     });
@@ -302,8 +320,7 @@ export async function ingestFile(args: IngestFileArgs): Promise<IngestFileResult
           file_size_bytes: args.file_bytes.length,
           mime_type: mimeTypeFor(args.filename),
           storage_path: args.file_path,
-        })
-      );
+        }));
       evidenceFileId = evidenceFile.id;
     }
 
@@ -350,10 +367,8 @@ export async function ingestFile(args: IngestFileArgs): Promise<IngestFileResult
     );
 
     const ctx = {
-      control_description:
-        control.refined_control_description ?? control.control_description ?? "",
-      expected_procedures:
-        control.refined_expected_procedure ?? control.expected_procedures ?? "",
+      control_description: control.refined_control_description ?? control.control_description ?? "",
+      expected_procedures: control.refined_expected_procedure ?? control.expected_procedures ?? "",
       tscs: tscsString,
       filename: args.filename,
     };
@@ -362,6 +377,64 @@ export async function ingestFile(args: IngestFileArgs): Promise<IngestFileResult
     }
     if (!ctx.expected_procedures) {
       throw new Error("Control has no expected_procedures (refined or raw)");
+    }
+
+    // Large PDFs are the one extraction class that can exceed an Edge Function
+    // isolate's wall-clock/memory budget. When Make is configured AND this call
+    // belongs to a durable sync run, dispatch the binary externally and return.
+    // Everything after extraction (embedding, scoped DB writes, linking, audit
+    // sequencing) remains inside Supabase and is performed by the callback.
+    if (
+      shouldUseMakeExtraction(fileType, args.sync_run_id) &&
+      (args.google_drive_file_id || args.external_download_url)
+    ) {
+      // Make owns the large-PDF iterator and Array aggregator. Supabase sends both
+      // authoritative prompt-library rows so Make does not carry stale prompt text.
+      // Step 2 produces the final document-level JSON and therefore supplies the
+      // extractor_prompt_id stored by the callback.
+      const [step1Prompt, step2Prompt] = await Promise.all([
+        loadActivePrompt("extractor_pdf_chunk"),
+        loadActivePrompt("extractor_pdf_aggregator"),
+      ]);
+      const external = await dispatchMakeExtraction({
+        sync_run_id: args.sync_run_id!,
+        engagement_id: engagementId,
+        control_uuid: control.id,
+        control_code: control.control_id,
+        evidence_file_id: evidenceFileId,
+        filename: args.filename,
+        storage_path: args.file_path,
+        google_drive_file_id: args.google_drive_file_id,
+        download_url: args.external_download_url,
+        file_size_bytes: args.file_bytes.length,
+        context: ctx,
+        step_1_prompt: step1Prompt,
+        step_2_prompt: step2Prompt,
+      });
+
+      await completeJobRun({
+        handle: job,
+        result: {
+          queued_external: true,
+          provider: "make",
+          external_job_id: external.job_id,
+          sync_run_id: args.sync_run_id,
+          evidence_file_id: evidenceFileId,
+          file_type: fileType,
+          file_size_bytes: args.file_bytes.length,
+        },
+      });
+      return {
+        status: "queued",
+        filename: args.filename,
+        evidence_file_id: evidenceFileId,
+        external_job_id: external.job_id,
+        job_run_id: job.id,
+        duration_ms: Date.now() - startTime,
+        file_type: fileType,
+        file_size_bytes: args.file_bytes.length,
+        storage_path: args.file_path,
+      };
     }
 
     // Claude extraction + OpenAI embedding happen outside any transaction.
@@ -379,7 +452,7 @@ export async function ingestFile(args: IngestFileArgs): Promise<IngestFileResult
            scratchpad, embedding, input_tokens, output_tokens)
         values
           (${evidenceFileId}, ${extraction.extractor_prompt_id},
-           ${tx.json(extraction.extracted_content)},
+           ${tx.json(extraction.extracted_content as Parameters<typeof tx.json>[0])},
            ${extraction.raw_extracted_text ?? null},
            ${extraction.scratchpad ?? null},
            ${JSON.stringify(embedding)},
@@ -431,8 +504,9 @@ export async function ingestFile(args: IngestFileArgs): Promise<IngestFileResult
     const e = err as Error;
     if (evidenceFileId) {
       // Best-effort status update on failure — don't let this throw suppress the real error.
-      await withEngagementScope(engagementId, (tx) =>
-        updateEvidenceFileStatus(tx, evidenceFileId!, "failed", e.message)
+      await withEngagementScope(
+        engagementId,
+        (tx) => updateEvidenceFileStatus(tx, evidenceFileId!, "failed", e.message),
       ).catch((se) => console.error(`Failed to mark evidence_file failed: ${se.message}`));
     }
     await failJobRun({ handle: job, error_message: e.message, error_stack: e.stack });

@@ -7,13 +7,12 @@ prior knowledge of the project.
 Read [HANDOVER.md](../HANDOVER.md) first for ownership and acceptance
 requirements.
 
-## 1. Current-state warning
+## 1. Source-alignment status
 
 Production runs in Supabase project `kwuymtlpjkziqkumixvk`.
 
-At the time of this review, this handover repository is **not a deployable copy
-of the complete production release**. It is missing post-snapshot changes,
-including:
+The `codex/refine-handover-notes` review branch was synchronized from production
+source commit `052c55d`. The synchronization includes:
 
 - `audit-worker` and the durable `audit_queue` handoff;
 - `make-extraction-callback`;
@@ -24,8 +23,9 @@ including:
 - final sweep verification; and
 - the latest refined-control field and prompt changes.
 
-Do not deploy this repository to production until it has been synchronized with
-the production source, tested, and tagged.
+The function, migration, prompt, Airtable, and helper-script trees match that
+production source. Do not deploy from the client repository until the draft PR
+is reviewed, merged, and tagged as the accepted handover release.
 
 ## 2. System summary
 
@@ -409,8 +409,8 @@ An initial “started” response is not proof of completion.
   detection.
 - Large-PDF reliability depends on Make.com and its connected PDF/AI services.
 - Make.com external extraction is not yet used for remediation attachments.
-- This repository must be aligned with production before it becomes the release
-  source of truth.
+- The synchronized review branch must be approved and merged before the client
+  repository becomes the release source of truth.
 
 ## 16. Acceptance
 

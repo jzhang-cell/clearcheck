@@ -30,12 +30,16 @@ import { callClaude } from "../_shared/claude-client.ts";
 import { loadActivePrompt } from "../_shared/load-prompt.ts";
 import { renderTemplate } from "../_shared/render-template.ts";
 import { completeJobRun, failJobRun, startJobRun } from "../_shared/job-run.ts";
-import { assertNotTruncated, parseAuditResponse } from "../_shared/claude-parse.ts";
+import {
+  assertNotTruncated,
+  conformityLevelToDropdown,
+  parseAuditResponse,
+} from "../_shared/claude-parse.ts";
 import { resolveEngagementByKey } from "../_shared/auth.ts";
 import { engagementSlug } from "../_shared/engagement-slug.ts";
 import { ingestFile } from "../_shared/ingest-file.ts";
 import type { IngestFileResult } from "../_shared/ingest-file.ts";
-import { createAirtableRecord } from "../_shared/airtable.ts";
+import { createAirtableRecord, patchAirtableRecord } from "../_shared/airtable.ts";
 import type { SupabaseClient } from "npm:@supabase/supabase-js@^2";
 
 const FUNCTION_NAME = "rerun-audit";
@@ -45,9 +49,6 @@ const WORKPAPER_PROMPT_KEY = "workpaper_renderer";
 // Opus 4.7 pricing per million tokens, USD (matches run-audit).
 const OPUS_INPUT_PER_M_USD = 5;
 const OPUS_OUTPUT_PER_M_USD = 25;
-// Sonnet 4.6 pricing per million tokens, USD (workpaper).
-const SONNET_INPUT_PER_M_USD = 3;
-const SONNET_OUTPUT_PER_M_USD = 15;
 
 const STORAGE_BUCKET = "evidence";
 const SIGNED_URL_TTL_SECONDS = 86400; // 24h — Airtable caches the file within this window
@@ -101,6 +102,7 @@ interface AirtableSyncResult {
   status?: number;
   error?: string;
   skip_reason?: "no_record_id" | "no_base_id" | "no_pat";
+  omitted_fields?: string[];
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -297,32 +299,12 @@ async function patchAirtable(args: {
   recordId: string | null;
   fields: Record<string, unknown>;
 }): Promise<AirtableSyncResult> {
-  if (!args.recordId) return { attempted: false, ok: true, skip_reason: "no_record_id" };
-  if (!args.baseId) return { attempted: false, ok: true, skip_reason: "no_base_id" };
-
-  const pat = Deno.env.get("AIRTABLE_PAT");
-  if (!pat) return { attempted: false, ok: true, skip_reason: "no_pat" };
-
-  const url = `https://api.airtable.com/v0/${args.baseId}/${AIRTABLE_TABLE_ID}/${args.recordId}`;
-  try {
-    const resp = await fetch(url, {
-      method: "PATCH",
-      headers: { "Authorization": `Bearer ${pat}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ fields: args.fields }),
-    });
-    if (!resp.ok) {
-      const body = await resp.text();
-      return {
-        attempted: true,
-        ok: false,
-        status: resp.status,
-        error: `Airtable PATCH ${resp.status}: ${body.slice(0, 500)}`,
-      };
-    }
-    return { attempted: true, ok: true, status: resp.status };
-  } catch (err) {
-    return { attempted: true, ok: false, error: `Airtable fetch threw: ${(err as Error).message}` };
-  }
+  return await patchAirtableRecord({
+    baseId: args.baseId,
+    tableId: AIRTABLE_TABLE_ID,
+    recordId: args.recordId,
+    fields: args.fields,
+  });
 }
 
 async function setStatus(
@@ -365,8 +347,7 @@ Deno.serve(async (req: Request) => {
 
   const attachments: Attachment[] = Array.isArray(payload.additional_evidence)
     ? payload.additional_evidence.filter(
-      (a): a is Attachment =>
-        !!a && typeof a.url === "string" && typeof a.filename === "string",
+      (a): a is Attachment => !!a && typeof a.url === "string" && typeof a.filename === "string",
     )
     : [];
   const notes = typeof payload.additional_notes === "string" ? payload.additional_notes.trim() : "";
@@ -379,7 +360,11 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  const mode = payload.mode === "notes" ? "notes" : payload.mode === "evidence" ? "evidence" : "rerun";
+  const mode = payload.mode === "notes"
+    ? "notes"
+    : payload.mode === "evidence"
+    ? "evidence"
+    : "rerun";
   const triggerSource = payload.trigger_source ?? "airtable";
 
   // Pre-flight: scoped load of the control + its previous verdict.
@@ -511,7 +496,11 @@ Deno.serve(async (req: Request) => {
           const done = ++doneFiles;
           if (done > lastBarShown) {
             lastBarShown = done;
-            await setStatus(airtableBase, control.airtable_record_id, progressBar(done, totalFiles));
+            await setStatus(
+              airtableBase,
+              control.airtable_record_id,
+              progressBar(done, totalFiles),
+            );
           }
         });
       }
@@ -632,8 +621,10 @@ Deno.serve(async (req: Request) => {
         let body = wpClaude.text.replace(/^[\s\S]*?<\/scratchpad>\s*/i, "").trim();
         if (body.length === 0) body = wpClaude.text.trim();
         workpaperText = body;
-        await withEngagementScope(engagementId, (tx) =>
-          tx`update audit_results set rendered_markdown = ${body} where id = ${resultData.id}`
+        await withEngagementScope(
+          engagementId,
+          (tx) =>
+            tx`update audit_results set rendered_markdown = ${body} where id = ${resultData.id}`,
         ).catch((e) => console.warn(`Failed to write rendered_markdown: ${e.message}`));
       } catch (err) {
         console.warn(`Workpaper render failed: ${(err as Error).message}`);
@@ -661,14 +652,14 @@ Deno.serve(async (req: Request) => {
         : String(audit.conformity_status);
       const airtableFields: Record<string, unknown> = {
         "ClearCheck 💬": `🥳 Re-run complete — ${verdictDisplay}`,
-        V3_Conformity_Level: String(audit.conformity_level),
+        V3_Conformity_Level: conformityLevelToDropdown(String(audit.conformity_level)),
         V3_Determination: String(audit.conformity_determination),
         V3_Briefing: String(audit.conformity_briefing),
         V3_Root_cause_analysis: String(audit.scratchpad ?? ""),
         V3_Root_cause_category: String(audit.root_cause_category ?? ""),
         V3_Potential_clarifications: String(audit.potential_clarifications ?? ""),
         V3_Cost_USD: cost.toFixed(4),
-        V3_Run_At: completedAt,
+        V3_Done_At: completedAt,
       };
       if (signedUrls.length > 0) {
         airtableFields.V3_Evidence = signedUrls;
@@ -733,8 +724,9 @@ Deno.serve(async (req: Request) => {
             set status = 'failed', completed_at = ${new Date().toISOString()},
                 duration_ms = ${Date.now() - runStart}, error_message = ${e.message}
             where id = ${auditRunId}
-          `
-        ).catch((se) => console.error(`Failed to mark audit_runs failed: ${(se as Error).message}`));
+          `).catch((se) =>
+            console.error(`Failed to mark audit_runs failed: ${(se as Error).message}`)
+          );
       }
       await failJobRun({ handle: job, error_message: e.message, error_stack: e.stack });
       return jsonResponse({ error: e.message, job_run_id: job.id, audit_run_id: auditRunId }, 500);

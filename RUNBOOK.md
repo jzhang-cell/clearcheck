@@ -11,8 +11,8 @@ deployment and architecture details, see
 3. Do not start a duplicate run until you confirm the existing sync is stale or
    failed.
 4. Never place secrets in Git, tickets, chat, or command history.
-5. Do not deploy from this handover repository until it is synchronized with
-   the complete production source.
+5. Do not deploy from the client repository until the synchronized handover PR
+   is reviewed, merged, and tagged.
 
 ## Routine workflows
 

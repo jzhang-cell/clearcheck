@@ -169,8 +169,8 @@ preserve logs before changing data.
 - Airtable and Make.com may retain execution inputs/outputs according to their
   configured plans and policies.
 - AI output is probabilistic and requires human review.
-- This handover repository is not yet aligned with the complete production
-  source.
+- The synchronized handover branch still requires review and acceptance before
+  it becomes the client-controlled release source.
 
 The incoming owner should assess these gaps against client contracts, privacy
 requirements, and the organization's risk appetite before expanding use.

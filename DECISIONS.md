@@ -68,13 +68,13 @@
 
 ---
 
-## ADR-008: RLS isolation via session badge + scoped role (shipped)
+## ADR-008: RLS isolation via session badge + scoped role (in progress)
 
-- **Date**: 2026-06 (foundation committed; function rewiring shipped via ADR-011)
+- **Date**: 2026-06 (foundation committed; function rewiring pending)
 - **Decision**: Enforce per-engagement isolation with RLS policies that read a per-request session GUC `app.current_engagement_id`, applied to a non-bypass `engagement_scoped` role the functions will use for client data. Implemented as **Label (0005) → Lock (0006) → Restrict foundation (0007)**, then Stamp + Restrict in the functions.
 - **Considered**: (a) keep relying on `WHERE engagement_id = …` in code (no DB enforcement); (b) per-user JWT + PostgREST RLS now.
 - **Rationale**: Code-only filtering is one forgotten clause away from a cross-client leak — unacceptable for compliance data. A DB-enforced lock can't be forgotten. The GUC/scoped-role mechanism aligns with the policies and avoids the JWT-key uncertainty for the pilot's machine caller.
-- **Status / risk**: **LIVE.** Foundation done + adversarially proven, and the Stamp + Restrict rewiring shipped via ADR-011 — all client-data operations run as `engagement_scoped` through `withEngagementScope()`. Proof harness: `supabase/tests/rls_isolation_proof.sql`.
+- **Status / risk**: foundation done + adversarially proven; **functions still use `service_role` (bypasses RLS), so isolation is NOT yet live.** Safe only because prod has one client. **Gating item before a second client's data lands.**
 - **Revisit if**: we move to per-user JWTs (the human path via `user_engagement_ids()` is already in the policies), or if direct-Postgres scoped connections prove unworkable from edge functions.
 - **Update**: the "Stamp + Restrict" rewiring is now the active ticket — see **ADR-011**, which combines it with per-engagement keys.
 
@@ -92,7 +92,7 @@
 
 - **Decision**: `run-audit` no longer runs its 1–2 min Opus/Sonnet/write-back pipeline inline. It validates + starts the job, dispatches the pipeline via `EdgeRuntime.waitUntil`, and returns a **202 "processing" ack** with `job_run_id`. The audit self-reports to Airtable on completion; outcome is tracked in `audit_runs`/`job_runs`. Falls back to inline-await when no background runtime exists (local serve, tests).
 - **Why**: the per-control Airtable script (ADR-012 step 4.2) awaits each call, and a full audit would exceed Airtable's ~30s script cap; worse, a dropped connection can terminate an Edge Function mid-pipeline. Backgrounding keeps the caller fast and the work safe. This is the lightweight, per-call version of ADR-009's "no 30s cap" goal — not the full paced coordinator, which is still deferred.
-- **Known gap (since closed)**: `sync-control-evidence` was still synchronous at the time; it has since been backgrounded the same way and self-chains past the worker wall-clock, and the paced coordinator shipped as `pace-controls` (ADR-014).
+- **Known gap**: `sync-control-evidence` is still synchronous and can approach the cap for controls with many evidence files. Background it the same way if it bites — or fold both into the async queue (ADR-006/007).
 
 ---
 
@@ -102,7 +102,7 @@
 - **Decision**: Pull evidence from each engagement's Drive folder using a Google service account (`drive.readonly`), mapping subfolders (`<control_id>-…`) to controls, into Supabase Storage (`scripts/sync-drive-evidence.ts`).
 - **Considered**: manual upload (status quo); per-user OAuth.
 - **Rationale**: A service account is unattended and fits an automated pipeline; folder-name prefix gives a clean control mapping.
-- **Status**: **LIVE** — Domain-Wide Delegation was granted (2026-06-25); `GOOGLE_SA_JSON` + `GOOGLE_DRIVE_SUBJECT` are set in Vault and the Drive pull now runs inside `sync-control-evidence` (ADR-012).
+- **Status**: built but **blocked** — the Shared Drive is members-only, so access needs a Workspace Super Admin to authorize Domain-Wide Delegation. Then add `subject: jzhang@decrypt.cpa` to the JWT.
 - **Revisit if**: the org won't grant DWD — fall back to per-user OAuth or a shared-with-SA folder outside the Shared Drive.
 
 ---
@@ -124,7 +124,7 @@
   - **(b) Short-lived JWT** carrying the role + an engagement claim, used with PostgREST. Closer to the eventual per-user JWT story but more moving parts now — and may be infeasible if prod uses Supabase's newer asymmetric JWT signing keys (no shared HS256 secret to sign with in-function).
   This choice drives the rewrite of `_shared/supabase-client.ts` and how every function does client-data reads/writes. System tables (`prompts`, `job_runs`) stay on `service_role`.
 - **Scope / new artifacts (planned)**: a migration adding the per-engagement key column to `engagements` (stored hashed, via `pgcrypto`) + backfill for the existing prod engagement; a new `_shared/auth.ts` path (`resolveEngagementByKey`) replacing/augmenting `checkSharedSecret`; the scoped DB client (`_shared/scoped-db.ts`, helper `withEngagementScope`); and Airtable automations updated to send each engagement's own key. Each Edge Function's handler header changes from "authenticate" to "authenticate **and** resolve engagement + stamp."
-- **Status (2026-06-27)**: **LIVE — both halves shipped and adversarially proven.** Per-engagement keys authenticate every per-control function (`resolveEngagementByKey`), and client-data access runs as `engagement_scoped` via `_shared/scoped-db.ts` / `withEngagementScope()`. Cross-engagement isolation proven: engagement A's key against engagement B's control returns 404. The build history below is kept for the record.
+- **Status (2026-06)**: **half 2 (per-engagement keys) foundation built; half 1 (RLS enforcement) still pending.**
   - **Done (keys):** migration `0008_engagement_api_keys.sql` (`api_key_hash` + `api_key_set_at` on `engagements`, unique index, SHA-256 hash only — done in Web Crypto so plaintext never reaches Postgres, *not* `pgcrypto` as originally sketched); `_shared/engagement-key.ts` (generate/hash); `register-engagement` mints + returns the key once on create and scrubs it from `job_runs`; `auth.resolveEngagementByKey()` (hash inbound → resolve the one owning engagement); `scripts/mint-engagement-key.ts` (backfill/rotate for the seeded prod engagement).
   - **Still pending (keys):** mint the prod engagement's key via the script; flip the per-engagement functions' auth from `checkSharedSecret` → `resolveEngagementByKey` (deferred to the RLS cutover so prod doesn't half-break); Airtable sends each engagement's own key.
   - **Still pending (RLS, half 1):** the `_shared/scoped-db.ts` + `withEngagementScope` helper and the client-data conversion across 4 functions + `_shared/ingest-file.ts` (~20 queries incl. a pgvector insert and the `control_tscs→tscs` join). Build plan unchanged: pilot `refine-control` + the helper, prove isolation locally, then fan out. **§0 fork RESOLVED 2026-06 → direct Postgres (pooler 6543, prepared statements off); ready to build.**
@@ -132,10 +132,10 @@
 
 ---
 
-## ADR-012: Drive-driven button workflow — `register-engagement` + `sync-control-evidence` (shipped)
+## ADR-012: Drive-driven button workflow — `register-engagement` + `sync-control-evidence` (planned)
 
 - **Date**: 2026-06
-- **Status**: **LIVE** — both functions are built and deployed; the Airtable button drives the entire pipeline, including the Drive pull. The target workflow below is preserved as designed.
+- **Status**: **PLANNED — not yet built.** Captures the agreed target workflow so the two new functions and the file-level impact are on record before implementation.
 - **Decision**: Make the Airtable `[Run V3]` button drive the *entire* pipeline — including pulling evidence from Google Drive — instead of relying on manual laptop scripts (`sync-drive-evidence.ts` + `orchestrate-ingest.ts`) to pre-stage evidence. Two new Edge Functions are introduced and the existing ones are left unchanged.
   - **Target flow**:
     - **Team (manual):** (1) upload evidence to Google Drive; (2) fill the Airtable Overview row with `google_drive_id`, `evidence_folder_id`, `engagement_id`.
@@ -180,7 +180,7 @@
 ## ADR-013: Re-run as a remediation (delta) pass — `rerun-audit` + `audit_remediation` prompt
 
 - **Date**: 2026-06-29
-- **Status**: **LIVE** — `rerun-audit` is deployed in production alongside the `audit_remediation` prompt and migration 0010.
+- **Status**: **BUILT on branch `claude/todo-item-5-r7o39e` — not yet deployed.** Implements NEXT_STEPS §5 ("re-run & richer audits").
 - **Context**: After a first audit, an auditor often wants to *close a gap* — they unzip a file, add a missing artifact, or explain context the model misread. The naïve approach is "re-judge everything," but that re-pulls Drive, re-reads all evidence, and re-pays the full Opus cost to re-derive a conclusion we already have.
 - **Decision**: A re-run is a **remediation pass over the delta**, not a fresh audit. It takes the **PREVIOUS verdict** + **only the new evidence/notes** the auditor just staged in Airtable, and a dedicated `audit_remediation` prompt (Rules 1–12, "first match wins") decides whether the new material **overturns / closes / fails to close** the prior gap, emitting a `Previous → New` status. This is why it can safely **skip Google Drive** — the old evidence's conclusion is already captured in the previous determination.
   - **Trigger**: a new Airtable single-select **`Re-run Audit 🤖`** on the control row, separate from the initial `Run V3 Audit` (Drive) button. Two options: *run with Additional Evidence* / *run with Additional Notes* → `mode` hint. **Forgiving**: whatever is staged is used regardless of the option (attachments ingested if present, notes included if present); the option only colors the 💬 wording.
@@ -205,8 +205,8 @@
 ## ADR-014: Fan-out throttle — cap DB connections + a paced `pace-controls` coordinator
 
 - **Date**: 2026-06-29
-- **Status**: **LIVE** — all three levers are deployed, and `pace-controls` was extended (2026-07-05) with a global in-flight cap plus a per-engagement fair share, so concurrently running engagements split the connection budget instead of stacking it. Triggered by an early full-engagement test where a 55-document run completed only 22/55 controls.
-- **Context**: An engagement run ticks **every** control at once. Each control's evidence-ingest (`sync-control-evidence`, `EVIDENCE_CONCURRENCY=5`) opens several Postgres connections, and `_shared/scoped-db.ts` pooled with the library default (`max:10`) **per edge isolate**. With ~15–20 controls firing together (plus `run-audit` and self-chained syncs), 100+ connections hit the Supabase transaction pooler (size ~50–70) → "no more connections allowed". That single failure cascaded into five different-looking symptoms (Evidence-Ready-but-no-audit, Partial-Evidence freezes, register errors, failed uploads, empty fields).
+- **Status**: **BUILT — needs deploy + Batch Test 02.** Triggered by Batch Test 01 (`docs/BATCH_TEST_01.md`): a 55-document engagement run completed only 22/55.
+- **Context**: An engagement run ticks **every** control at once. Each control's evidence-ingest (`sync-control-evidence`, `EVIDENCE_CONCURRENCY=5`) opens several Postgres connections, and `_shared/scoped-db.ts` pooled with the library default (`max:10`) **per edge isolate**. With ~15–20 controls firing together (plus `run-audit` and self-chained syncs), 100+ connections hit the Supabase transaction pooler (size ~50–70) → "no more connections allowed". That single failure cascaded into five different-looking symptoms (Evidence-Ready-but-no-audit, Partial-Evidence freezes, register errors, failed uploads, empty fields) — see Batch Test 01 for the symptom→cause mapping.
 - **Decision**: three layered levers, smallest blast radius first.
   1. **Cap the pool per isolate** (`scoped-db.ts`): `max:5` (env `SCOPED_DB_POOL_MAX`) + `idle_timeout:20` + `max_lifetime:300` + `connect_timeout:15`. `max:5` matches the only real in-isolate concurrency (the 5 file workers) without serializing, while halving the per-isolate ceiling. Shared module → **all five client-data functions must be redeployed**.
   2. **Right-size the pooler** (infra): keep prod pool size ~50–70 so, at `max:5`/isolate, ~10–12 concurrent control isolates fit with headroom.
@@ -227,3 +227,20 @@
 - **Found while testing a second project.** Each project is its own **Airtable base** (a duplicate of the template), and every base's engagement is "the first row". `register-engagement` keyed the upsert on that row's **record id** (`airtable_base_id`, a misnomer — it holds the `rec…`, not the base `app…`). So registering a *new* project could match an *existing* engagement row and **UPDATE/override** it instead of creating a new one — and on the update path no per-engagement key is minted, so `supabase_key` came back blank.
 - **Fix**: match on the Airtable **base id** (`airtable_base` = `app…`) first — the true unique key (one base = one engagement) — falling back to the legacy record-id key only when the base id doesn't match (so pre-backfill engagements still resolve; the update backfills `airtable_base`). Migration `0011` adds a partial unique index on `airtable_base`. The master script already sends `airtable_base: base.id`, so no Airtable change is needed.
 - **Cleanup note**: the earlier override left a single mixed engagement row in prod. For a clean test, delete the affected engagement row(s) (or re-register each base — a new base now creates its own row + key), then re-run.
+
+---
+
+## ADR-015: Durable audit queue — replace the fire-and-forget sync → run-audit handoff
+
+- **Date**: 2026-07-21
+- **Status**: **BUILT — needs deploy (see NEXT_STEPS §7) + a live confirmation run.**
+- **Context**: Batch Test 04 challenge #3: on 3 of ~110 controls, evidence ingested fine but the audit never started — the single fire-and-forget POST from `sync-control-evidence` to `run-audit` was lost, and NOTHING could see it: the sync job had *succeeded*, so there was no stuck `running` row for the watchman, no error in `job_runs`, and the 💬 sat on "starting the audit…" forever. Every safety net to date (pool caps, `pace-controls`, `sweep-stuck-jobs`) compensates for the same root gap: work-transfer lives in network packets, not in durable state.
+- **Decision**: Make the handoff a **durable queue** on infrastructure we already run:
+  1. **`audit_queue` table (migration 0015)** — a plain public-schema table, written on the service client exactly like `job_runs`. A partial unique index (one live row per control) collapses double-enqueues at the DB. RLS on, no policies — system table.
+  2. **`claim_audit_jobs` RPC** — the one piece that must be SQL: reclaim expired leases, then claim a small batch with `FOR UPDATE SKIP LOCKED` (N workers can never collide), bumping `attempts` at claim time (a killed worker can't self-report, so the claim is the only countable moment).
+  3. **`audit-worker` function** — SYSTEM function (shared secret, like `sweep-stuck-jobs`), poked every minute by pg_cron/pg_net (the delivery guarantee) and "kicked" by the enqueuer for latency. Claims 2–3 rows, runs them concurrently, marks done / retries with backoff (2m/4m/8m) / dead-letters after 3 attempts with a "press Re-run" 💬. An idempotency guard (completed `audit_runs` row since `enqueued_at`) means a crash after commit but before ack skips the re-run instead of paying Opus twice.
+  4. **`_shared/audit-pipeline.ts`** — run-audit's pipeline extracted to a shared module. The worker **cannot** POST to `run-audit`: per-engagement keys are stored only as SHA-256 hashes, so a cron-woken worker has no plaintext to forward (the old chain only worked by forwarding the caller's inbound key). Importing the pipeline needs no key — the queue row carries the engagement id and every client-data query still runs under `withEngagementScope`, so RLS still bites. `run-audit`'s HTTP entry remains for manual/smoke-test calls, running the identical shared code, and job_runs rows keep `function_name='run-audit'` so monitoring queries are unchanged.
+- **Also fixed en route**: run-audit's Airtable write-back had NO 429 retry (a local plain-`fetch` helper) while the retrying `_shared/airtable.ts` existed — the verdict, the most important write in the system, was the least protected. The pipeline now uses the shared helper.
+- **Considered**: (a) just retry the POST (`fetchWithRetry`) — shipped as a stopgap for the remaining self-chain hops, but a retry that also fails, or an isolate killed before the trigger line, still drops the work; (b) **pgmq / Supabase Queues** — same semantics for less code, but it lives in its own schema (service client can't call it without exposing `pgmq_public` or new raw-SQL grant plumbing), while a public-schema table rides the proven `job_runs` posture, is visible in Studio, and keeps the retry/dead-letter logic unit-testable in the repo's pure-logic style (`queue-logic.ts` + `queue.test.ts`); (c) external queue (Inngest/Trigger.dev, ADR-006/007) — still the eventual answer at 20+ clients, but not needed to fix this failure class.
+- **Failure modes now**: lost kick → cron picks up in ≤60s; worker killed mid-audit → lease lapses, job reclaims and retries; crash after audit committed → idempotency guard skips; 3 strikes → dead-letter + auditor 💬; enqueue itself fails (the one remaining single point) → loud ⚠️ 💬 on the control instead of a silent stall.
+- **Revisit if**: Phase 2 (per-file ingest queue — deletes the sync self-chain, `SYNC_BUDGET_MS`, the settle-wait, and the per-file-timeout race) and Phase 3 (retire `pace-controls`; worker batch size becomes the one concurrency knob) per the scalability review; or queue volume/latency outgrows a cron-poked worker — then move the same job rows onto an external runner.

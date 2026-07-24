@@ -2,7 +2,7 @@ import { callClaude, imageBlock, pdfDocumentBlock, textBlock } from "./claude-cl
 import { loadActivePrompt } from "./load-prompt.ts";
 import { renderTemplate } from "./render-template.ts";
 import { extractDocText } from "./docx-utils.ts";
-import { splitPdfIntoChunks } from "./pdf-utils.ts";
+import { copyPageRange, loadPdf } from "./pdf-utils.ts";
 import { mimeTypeFor } from "./file-type.ts";
 import type { FileType } from "./file-type.ts";
 import { assertNotTruncated, parseClaudeJson } from "./claude-parse.ts";
@@ -50,6 +50,20 @@ const PDF_CHUNK_MAX_ATTEMPTS = Math.max(
 const PDF_SECTION_PAGES = Math.max(
   1,
   Number(Deno.env.get("PDF_SECTION_PAGES") ?? "10"),
+);
+
+// Parallelism for GIANT documents (>12 sections ≈ >120 pages). Full fan-out on
+// a 150+ page report holds too many section bodies in memory at once.
+const PDF_CHUNK_CONCURRENCY_LARGE = Math.max(
+  1,
+  Number(Deno.env.get("PDF_CHUNK_CONCURRENCY_LARGE") ?? "4"),
+);
+
+// Absolute page ceiling — beyond this we fail politely and ask for the file to
+// be split, rather than grinding a worker for many minutes.
+const PDF_MAX_PAGES = Math.max(
+  60,
+  Number(Deno.env.get("PDF_MAX_PAGES") ?? "400"),
 );
 
 // The control + TSC context that every extractor prompt needs at minimum.
@@ -195,13 +209,28 @@ async function extractImage(
     throw new Error(`Unsupported image mime type: ${mt}`);
   }
 
-  const claude = await callClaude({
-    model: prompt.model,
-    system: prompt.system_prompt,
-    user: [imageBlock(bytes, mt), textBlock(userText)],
-    max_tokens: prompt.max_tokens,
-    timeout_ms: EXTRACT_TIMEOUT_MS,
-  });
+  let claude;
+  try {
+    claude = await callClaude({
+      model: prompt.model,
+      system: prompt.system_prompt,
+      user: [imageBlock(bytes, mt), textBlock(userText)],
+      max_tokens: prompt.max_tokens,
+      timeout_ms: EXTRACT_TIMEOUT_MS,
+    });
+  } catch (err) {
+    const msg = (err as Error).message ?? "";
+    // The API rejects empty/corrupt image payloads with a 400 invalid_request_error
+    // mentioning image.source — surface that as a fix-the-file instruction instead
+    // of the raw API JSON.
+    if (msg.includes("image") && (msg.includes("invalid_request_error") || msg.includes("400"))) {
+      throw new Error(
+        `🖼️ '${ctx.filename}' appears to be an empty or corrupted image — please replace ` +
+          `it in Drive with a valid screenshot/photo and re-run.`,
+      );
+    }
+    throw err;
+  }
 
   assertNotTruncated({
     stop_reason: claude.stop_reason,
@@ -265,13 +294,44 @@ async function extractPdfLarge(
 ): Promise<ExtractionResult> {
   // Split a big PDF into PDF_SECTION_PAGES-page SECTIONS and run each through the SAME
   // fast single-call path used for a small PDF, in parallel — then combine the section
-  // results MECHANICALLY (no extra LLM call). This replaces the old 5-page-chunk +
-  // LLM-aggregator design, whose aggregator step regenerated a huge combined JSON and
-  // was so slow that 100+ page PDFs never finished in the per-file window and got
-  // skipped. A 110-page PDF now finishes in ~1 minute (4 parallel section calls)
-  // instead of 5+, and every section's evidence still reaches the audit.
-  const sections = await splitPdfIntoChunks(bytes, PDF_SECTION_PAGES);
-  const totalSections = sections.length;
+  // results MECHANICALLY (no extra LLM call).
+  //
+  // LAZY splitting (Batch Test 05 hardening): sections are serialized ON DEMAND,
+  // one at a time, right before their API call — never all up-front. Building
+  // every section eagerly held all their bytes at once and did the whole
+  // pdf-lib CPU work in one burst, which got the worker killed mid-file on
+  // 150+ page vendor reports (a real 189-page SOC 2 report measured ×4.5 byte
+  // blowup and multi-second CPU). The split mutex below keeps pdf-lib's shared
+  // source parsing single-file while API calls still overlap.
+  let source;
+  try {
+    source = await loadPdf(bytes);
+  } catch {
+    throw new Error(
+      `'${ctx.filename}' is not a readable PDF — it appears corrupt or was saved/renamed ` +
+        `incorrectly. Please re-export it as a standard PDF and re-upload.`,
+    );
+  }
+  const totalPages = source.getPageCount();
+  if (totalPages > PDF_MAX_PAGES) {
+    throw new Error(
+      `'${ctx.filename}' has ${totalPages} pages — too large to process as one file. ` +
+        `Please split it into parts of ~100 pages each in Drive, or upload a ` +
+        `spreadsheet/text version of the report.`,
+    );
+  }
+  const totalSections = Math.ceil(totalPages / PDF_SECTION_PAGES);
+
+  // Sections are produced strictly one at a time (CPU-bound; parallel copies of a
+  // shared pdf-lib doc gain nothing and risk its internal caches interleaving).
+  let splitTail: Promise<unknown> = Promise.resolve();
+  const sectionBytes = (i: number): Promise<Uint8Array> => {
+    const p = splitTail.then(() =>
+      copyPageRange(source, i * PDF_SECTION_PAGES, (i + 1) * PDF_SECTION_PAGES)
+    );
+    splitTail = p.catch(() => {});
+    return p;
+  };
 
   // Load the small-PDF extractor once; every section uses it.
   const prompt = await loadActivePrompt("extractor_pdf_small");
@@ -285,12 +345,37 @@ async function extractPdfLarge(
     output: number;
   }
 
-  const slots: SectionRecord[] = new Array(sections.length);
+  const slots: SectionRecord[] = new Array(totalSections);
   let next = 0;
   const worker = async (): Promise<void> => {
     while (true) {
       const i = next++;
-      if (i >= sections.length) return;
+      if (i >= totalSections) return;
+
+      // Serialize THIS section's pages now — its bytes live only for this loop turn.
+      let secBytes: Uint8Array;
+      try {
+        secBytes = await sectionBytes(i);
+      } catch (err) {
+        console.error(
+          `pdf_large section ${i + 1}/${totalSections} could not be split: ` +
+            `${(err as Error).message.slice(0, 160)}`,
+        );
+        slots[i] = {
+          section: i + 1,
+          extracted_content: {
+            section_skipped: true,
+            section_number: i + 1,
+            total_sections: totalSections,
+            reason: "section could not be extracted from the PDF",
+          },
+          scratchpad: null,
+          raw: "",
+          input: 0,
+          output: 0,
+        };
+        continue;
+      }
 
       const userText = renderTemplate(prompt.user_prompt_template, {
         control_description: ctx.control_description,
@@ -308,7 +393,7 @@ async function extractPdfLarge(
           const claude = await callClaude({
             model: prompt.model,
             system: prompt.system_prompt,
-            user: [pdfDocumentBlock(sections[i]), textBlock(userText)],
+            user: [pdfDocumentBlock(secBytes), textBlock(userText)],
             max_tokens: prompt.max_tokens,
             timeout_ms: EXTRACT_TIMEOUT_MS,
           });
@@ -360,8 +445,14 @@ async function extractPdfLarge(
       }
     }
   };
+  // Giant documents get LOWER parallelism: each in-flight section holds its
+  // bytes + base64 request body in memory, and a 150+ page report at full
+  // fan-out is exactly the profile that used to kill workers.
+  const sectionConcurrency = totalSections > 12
+    ? PDF_CHUNK_CONCURRENCY_LARGE
+    : PDF_CHUNK_CONCURRENCY;
   await Promise.all(
-    Array.from({ length: Math.min(PDF_CHUNK_CONCURRENCY, sections.length) }, () => worker()),
+    Array.from({ length: Math.min(sectionConcurrency, totalSections) }, () => worker()),
   );
 
   const totalInput = slots.reduce((sum, s) => sum + s.input, 0);

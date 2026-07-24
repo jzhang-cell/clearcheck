@@ -1,4 +1,4 @@
-// sweep-logic.ts — pure decision logic for the stuck-job watchman.
+// sweep-logic.ts — pure decision logic for the stuck-job watchman (NEXT_STEPS §6).
 //
 // Separated from index.ts (like pace-logic.ts) so the "which jobs are stuck and
 // what do we tell the user" decision is unit-testable with no DB/HTTP.
@@ -27,6 +27,21 @@ export interface SweepDecision {
   // control's UUID if the payload carried one — lets index.ts resolve the
   // Airtable row to post a recovery 💬 to. Null for system jobs (no 💬 to write).
   control_uuid: string | null;
+  stuck_minutes: number;
+}
+
+export interface ExternalExtractionJobRow {
+  id: string;
+  sync_run_id: string;
+  engagement_id: string;
+  control_uuid: string;
+  evidence_file_id: string;
+  filename: string;
+  status: string;
+  updated_at: string;
+}
+
+export interface ExternalSweepDecision extends ExternalExtractionJobRow {
   stuck_minutes: number;
 }
 
@@ -73,6 +88,32 @@ export function planSweep(args: {
   }
 
   return decisions;
+}
+
+export function planExternalSweep(args: {
+  rows: ExternalExtractionJobRow[];
+  nowMs: number;
+  staleMs: number;
+}): ExternalSweepDecision[] {
+  const activeStatuses = new Set(["queued", "processing", "completing"]);
+  const decisions: ExternalSweepDecision[] = [];
+  for (const row of args.rows) {
+    if (!activeStatuses.has(row.status)) continue;
+    const updatedMs = Date.parse(row.updated_at);
+    if (!Number.isFinite(updatedMs)) continue;
+    const ageMs = args.nowMs - updatedMs;
+    if (ageMs < args.staleMs) continue;
+    decisions.push({
+      ...row,
+      stuck_minutes: Math.floor(ageMs / 60_000),
+    });
+  }
+  return decisions;
+}
+
+export function externalSweptErrorMessage(filename: string, stuckMinutes: number): string {
+  return `Make extraction for '${filename}' produced no callback for ${stuckMinutes}m ` +
+    "and was closed by the watchman.";
 }
 
 // The message written to the job_runs.error_message when we declare a row dead.

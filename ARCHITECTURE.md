@@ -4,9 +4,9 @@ This document describes the live production design. See
 [docs/TECHNICAL_HANDOVER.md](docs/TECHNICAL_HANDOVER.md) for operations and
 deployment.
 
-> This handover repository is not yet synchronized with every production
-> component described below. Complete the source-alignment checklist before
-> deploying from it.
+> The handover review branch was synchronized from production source commit
+> `052c55d`. Complete PR review and handover acceptance before deploying from
+> the client repository.
 
 ## Design goals
 

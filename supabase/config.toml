@@ -440,3 +440,9 @@ verify_jwt = false
 
 [functions.sweep-stuck-jobs]
 verify_jwt = false
+
+[functions.audit-worker]
+verify_jwt = false
+
+[functions.make-extraction-callback]
+verify_jwt = false

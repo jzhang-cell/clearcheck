@@ -15,14 +15,14 @@ judgment or final sign-off.
 | Auditor workflow | Live in Airtable | Confirm the production automations match the reference scripts. |
 | Evidence sources | Airtable attachments first, Google Drive as fallback | Confirm both sources with a test control. |
 | Large PDFs | Offloaded to Make.com when configured | Confirm the Make scenario, connection owner, and callback secret. |
-| This repository | **Not yet aligned with the complete production source** | Synchronize the final production code before deploying from this repository. |
+| This repository | Production source synchronized on `codex/refine-handover-notes` from production commit `052c55d` | Review and merge the draft PR, then record the accepted client-repository commit. |
 | Ownership transfer | Pending acceptance | Complete the checklist at the end of this document. |
 
-> **Important:** this repository currently predates several production changes,
-> including the durable audit worker, Make.com large-PDF callback, external
-> extraction tables, Airtable-first evidence selection, and enhanced sweep
-> verification. Treat it as a handover documentation workspace until the final
-> production source is synchronized and validated.
+> **Important:** the production source has been synchronized onto the handover
+> review branch, including the durable audit worker, Make.com large-PDF
+> callback, external extraction tables, Airtable-first evidence selection, and
+> enhanced sweep verification. Do not deploy it until the draft PR is reviewed,
+> merged, and tagged as the accepted handover release.
 
 ## What ClearCheck does
 
@@ -141,7 +141,7 @@ Do not complete the handover until each role has a named owner.
 
 ### Source and configuration
 
-- [ ] This repository has been synchronized with the exact production source.
+- [ ] The synchronized production-source PR has been reviewed and merged.
 - [ ] The default branch and production release/commit have been recorded.
 - [ ] Airtable's live scripts have been compared with `airtable/`.
 - [ ] Active Supabase prompts have been compared with `supabase/prompts/`.

@@ -5,6 +5,28 @@ export type FileType = "csv" | "pdf_small" | "pdf_large" | "image" | "doc";
 export const PDF_LARGE_THRESHOLD = 50;
 export const PDF_PAGES_PER_CHUNK = 5;
 
+const VIDEO_EXTENSIONS = new Set(["mp4", "mov", "avi", "mkv", "webm", "m4v"]);
+
+// The PDF header must appear near the beginning of the file. Checking the
+// binary signature lets us distinguish a genuine but locally unsupported PDF
+// (for example AES-256 encrypted) from HTML or another file merely renamed
+// with a .pdf extension.
+export function hasPdfHeader(bytes: Uint8Array): boolean {
+  const signature = [0x25, 0x50, 0x44, 0x46, 0x2d]; // %PDF-
+  const searchLimit = Math.min(bytes.length - signature.length + 1, 1024);
+  for (let offset = 0; offset < searchLimit; offset++) {
+    let matches = true;
+    for (let index = 0; index < signature.length; index++) {
+      if (bytes[offset + index] !== signature[index]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return true;
+  }
+  return false;
+}
+
 export async function detectFileType(
   filename: string,
   bytes: Uint8Array,
@@ -13,7 +35,29 @@ export async function detectFileType(
 
   if (ext === "csv" || ext === "tsv") return "csv";
   if (ext === "pdf") {
-    const pages = await countPdfPages(bytes);
+    let pages: number;
+    try {
+      pages = await countPdfPages(bytes);
+    } catch (error) {
+      if (hasPdfHeader(bytes)) {
+        // Some genuine PDFs (notably AES-256 encrypted files with copy
+        // restrictions) cannot be parsed by pdf-lib. Classify them as large so
+        // the durable Make path can attempt external extraction instead of
+        // rejecting them based on the local parser's limitations.
+        console.warn(
+          `Local PDF inspection failed for '${filename}'; routing to external extraction: ${
+            (error as Error).message
+          }`,
+        );
+        return "pdf_large";
+      }
+      // No PDF signature: this is usually a web page or another file renamed
+      // with a .pdf extension.
+      throw new Error(
+        `'${filename}' is not a readable PDF — it appears corrupt or was saved/renamed ` +
+          `incorrectly. Please re-export it as a standard PDF and re-upload.`,
+      );
+    }
     return pages > PDF_LARGE_THRESHOLD ? "pdf_large" : "pdf_small";
   }
   if (ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "gif" || ext === "webp") {
@@ -21,7 +65,16 @@ export async function detectFileType(
   }
   if (ext === "docx" || ext === "doc" || ext === "txt" || ext === "md") return "doc";
 
-  throw new Error(`Unsupported file extension '.${ext}' (filename: ${filename})`);
+  if (VIDEO_EXTENSIONS.has(ext)) {
+    throw new Error(
+      `🎬 Video files can't be read as audit evidence ('${filename}'). Please provide ` +
+        `documents, spreadsheets, or screenshots instead.`,
+    );
+  }
+  throw new Error(
+    `Files of type '.${ext}' can't be read as audit evidence ('${filename}'). Supported: ` +
+      `PDF, Word (docx), CSV/Excel, text, and images (PNG/JPG).`,
+  );
 }
 
 export function mimeTypeFor(filename: string): string {
@@ -50,10 +103,15 @@ export function mimeTypeFor(filename: string): string {
 // since that's the one whose extracted_content gets stored as the final result.
 export function primaryPromptKeyFor(fileType: FileType): string {
   switch (fileType) {
-    case "csv":       return "extractor_csv";
-    case "pdf_small": return "extractor_pdf_small";
-    case "image":     return "extractor_image";
-    case "doc":       return "extractor_doc";
-    case "pdf_large": return "extractor_pdf_aggregator";
+    case "csv":
+      return "extractor_csv";
+    case "pdf_small":
+      return "extractor_pdf_small";
+    case "image":
+      return "extractor_image";
+    case "doc":
+      return "extractor_doc";
+    case "pdf_large":
+      return "extractor_pdf_aggregator";
   }
 }
