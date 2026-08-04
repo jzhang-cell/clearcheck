@@ -25,7 +25,16 @@ deployment and architecture details, see
 5. Save the returned engagement UUID and per-engagement key in the configured
    Airtable fields.
 6. Verify the engagement row in Supabase.
-7. Run one test control before launching the engagement.
+7. Place the client's control list as a single CSV in the engagement's
+   `Client Control` Drive folder.
+8. Select `C2C Analysis` on the Audit Overview row. The `💬` field reports
+   `Uploading Client Controls`, then the analysis progress, then completion.
+9. Confirm the controls table is populated and that `Baseline Change Type` is
+   set on each imported control.
+10. Run one test control before launching the engagement.
+
+Import the controls before running any audit, so each control carries its
+baseline link and comparison result from the start.
 
 Avoid manual database inserts unless performing a documented repair.
 
@@ -215,6 +224,8 @@ Investigate growing `dead`, `failed`, or long-lived `processing` counts.
 | One file fails | Unsupported/corrupt file, timeout, or extraction error | Inspect `evidence_files.error_message`; correct file and rerun |
 | Prompt change has no effect | Markdown was changed but DB prompt was not activated | Sync the intended prompt and verify one active version |
 | Airtable script change has no effect | Repository copy was not pasted into Airtable | Publish the script to the correct automation and test |
+| `Missing Client Control CSV` | The `Client Control` folder or its CSV was not found | Confirm the folder sits directly under the engagement's Drive root and holds exactly one CSV |
+| C2C reports multiple folders or CSVs | More than one candidate was found | Remove the duplicates; the import never selects one arbitrarily |
 
 ## Deployment checklist
 

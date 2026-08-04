@@ -45,6 +45,22 @@ The important columns you'll use:
 | **V3_Conformity_Level** | The final rating (e.g. "No Deviation", "Observation", "Deviation"). |
 | **V3_Results** | The full written-up audit note (the workpaper). |
 | **Re-run Audit 🤖** | Used to re-check a control after you add more evidence (see Section 6). |
+| **Baseline Change Type** | Whether this control's wording differs from the standard baseline wording. |
+| **Baseline Change Suggestion** | A one-line explanation of that difference. |
+
+**About the last two columns.** When a client's control list is first loaded, each
+control's description is compared with Decrypt's standard baseline wording, and the
+result is filled in for you. You'll see one of three things:
+
+- **✅ No difference** — the wording matches the baseline in meaning.
+- **🔎 Editorial change** — the words were changed but the meaning wasn't. Test the
+  control as you normally would.
+- **🚨 Substantive change** — the meaning itself changed. Read
+  **Baseline Change Suggestion** before you start: the difference may change what you
+  need to test, or what evidence you should expect to see.
+
+This is a prompt to look more closely, not a verdict. Your own reading of the control
+decides how it gets tested.
 
 ---
 
