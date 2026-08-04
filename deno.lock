@@ -487,6 +487,7 @@
   },
   "workspace": {
     "dependencies": [
+      "jsr:@std/assert@1",
       "jsr:@std/yaml@1",
       "npm:postgres@3"
     ]

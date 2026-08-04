@@ -52,7 +52,7 @@ export interface ControlRow {
   id: string;
   engagement_id: string;
   control_id: string;
-  refined_control_description: string | null;
+  control_description: string | null;
   refined_expected_procedure: string | null;
   refinement_status: string;
   airtable_record_id: string | null;
@@ -93,7 +93,7 @@ interface EvidenceRow {
 
 async function loadControl(tx: Sql, controlId: string): Promise<ControlRow | null> {
   const rows = await tx<ControlRow[]>`
-    select id, engagement_id, control_id, refined_control_description,
+    select id, engagement_id, control_id, control_description,
            refined_expected_procedure, refinement_status, airtable_record_id
     from controls
     where id = ${controlId}
@@ -215,11 +215,11 @@ export async function loadControlForAudit(
           `Run refine-control first.`,
       };
     }
-    if (!c.refined_control_description || !c.refined_expected_procedure) {
+    if (!c.control_description || !c.refined_expected_procedure) {
       return {
         ok: false,
         status: 400,
-        error: "Control marked refined but refined_* fields are empty",
+        error: "Control is missing its original description or refined expected procedure",
       };
     }
     return { ok: true, control: c };
@@ -324,7 +324,7 @@ export async function runAuditPipeline(args: {
     const evidenceFileIds = [...new Set(evidence.map((e) => e.evidence_file_id))];
 
     const userText = renderTemplate(prompt.user_prompt_template, {
-      control_description: control.refined_control_description!,
+      control_description: control.control_description!,
       expected_procedures: control.refined_expected_procedure!,
       tscs: tscsString,
       evidence_synthesis: evidenceSynthesis,
@@ -431,7 +431,7 @@ export async function runAuditPipeline(args: {
     try {
       const wpPrompt = await loadActivePrompt(WORKPAPER_PROMPT_KEY);
       const wpUserText = renderTemplate(wpPrompt.user_prompt_template, {
-        control_description: control.refined_control_description!,
+        control_description: control.control_description!,
         expected_procedures: control.refined_expected_procedure!,
         conformity_determination: audit.conformity_determination,
         additional_comments: "",

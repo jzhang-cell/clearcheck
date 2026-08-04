@@ -285,7 +285,8 @@ insert into engagement_users (engagement_id, user_id, role) values (
 -- ───────────────────────────────────────────────────────────────────
 -- Controls: CC.01.02 and CC.02.01
 -- raw control_description and expected_procedures only;
--- refined_* fields stay NULL until refine-control function runs.
+-- refined_expected_procedure stays NULL until refine-control runs;
+-- refined_control_description remains NULL because source wording is preserved.
 -- ───────────────────────────────────────────────────────────────────
 
 -- CC.01.02

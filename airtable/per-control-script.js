@@ -3,7 +3,7 @@
 //
 // Runs four calls IN ORDER:
 //   0. register-control      — upsert the control + TSC links.        HARD FAIL.
-//   1. refine-control        — polish the description.                BEST-EFFORT.
+//   1. refine-control        — polish the expected procedure only.   BEST-EFFORT.
 //   2. sync-control-evidence — Drive → Storage → ingest.              HARD FAIL.
 //   3. run-audit             — kicks the Opus/Sonnet pipeline in the BACKGROUND
 //      and returns a fast 202 ack. It writes its own results back to Airtable
@@ -155,10 +155,9 @@ if (config.controlTable && config.airtableControlRecordId) {
 }
 
 // ── 1. refine-control — BEST-EFFORT (continue on failure) ──────────────────
-await setStatus("⏳ Polishing control description…"); // step 3 in user-visible sequence
-// Runs right after register because it only needs the control's description —
-// no evidence required. Moved ahead of sync so run-audit later sees the polished
-// description, and so this step still completes when Drive isn't wired up yet.
+await setStatus("⏳ Polishing expected procedure…");
+// Runs right after register because it needs no evidence. The original control
+// description is preserved; only the expected audit procedure is polished.
 let refine = await callFn("refine-control", { control_uuid: controlUuid });
 if (!refine.ok) {
   console.warn(`refine-control failed (HTTP ${refine.status}): ${refine.result.error || refine.text} — continuing`);

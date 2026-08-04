@@ -446,3 +446,6 @@ verify_jwt = false
 
 [functions.make-extraction-callback]
 verify_jwt = false
+
+[functions.c2c-analysis]
+verify_jwt = false

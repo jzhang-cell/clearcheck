@@ -39,6 +39,31 @@ Airtable ───────────────► Supabase Edge Function
 Airtable is the interaction surface. Supabase is the system of record for
 workflow and audit state.
 
+## Client control import
+
+`c2c-analysis` loads an engagement's own control list before any control is
+audited. It reads the single CSV in the engagement's `Client Control` Drive
+folder, upserts the controls into Airtable, and classifies how each client
+control description differs from its baseline.
+
+```text
+c2c-analysis
+      │
+      ├─ read the one CSV in the Client Control folder
+      │
+      ├─ upsert Airtable controls, keyed on the baseline control link
+      │
+      ├─ compare each description with its baseline description
+      │
+      └─ write the change type and explanation back to Airtable
+```
+
+The comparison receives only the control ID and the two descriptions. Each
+control is classified as no difference, an editorial change, or a substantive
+change, so an auditor can see which client wording would alter testing. Missing
+or ambiguous source folders and files fail visibly rather than selecting one
+arbitrarily.
+
 ## Initial-control flow
 
 ```text
@@ -138,6 +163,7 @@ collection. Large-PDF sub-jobs live in `external_extraction_jobs`.
 | Function | Category |
 |---|---|
 | `register-engagement` | Setup |
+| `c2c-analysis` | Control import and baseline comparison |
 | `register-control` | Setup |
 | `refine-control` | AI refinement |
 | `sync-control-evidence` | Evidence orchestration |
@@ -190,6 +216,7 @@ points use separate system secrets and narrowly defined payloads.
 ## AI responsibilities
 
 - Claude Haiku-class models: control refinement and high-volume extraction.
+- Claude mid-tier model: baseline change classification.
 - Claude higher-reasoning model: audit judgment.
 - Claude rendering model: workpaper drafting.
 - OpenAI: evidence embeddings.

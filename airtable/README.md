@@ -16,6 +16,43 @@ The end-to-end flow is the ADR-012 Drive-driven `[Run V3]` button.
 3. **Checks `Run_All_V3_Audits`** on the engagement record (last, as its own
    write). That checkbox is the trigger for the tick-controls automation below.
 
+## `c2c-analysis-script.js` — import and compare the client's controls
+
+Fired from the Audit Overview table (`tblrb4PpeCCIShcnl`) when `C2C Analysis`
+triggers, once per engagement and before controls are audited. The script
+discovers the linked tables behind `Baseline Control ID` and `TSC Criteria`,
+then makes one fast call to the background `c2c-analysis` function. The Drive
+download, Airtable upserts, Claude analysis, and result write-back continue
+server-side after the function returns its **202 ack**.
+
+The server finds the immediate `Client Control` child folder beneath the
+engagement's saved Google Drive ID and requires exactly one CSV. It identifies
+the CSV's Control ID, Control Description, Criteria, and Owner columns; ignores
+Expected Evidence, Status, and blank-ID evidence continuation rows; writes the
+CSV Control ID into both `Control ID` and the linked `Baseline Control ID`; and
+idempotently upserts the controls table keyed on that baseline link. It then
+compares each `Control Description` with the linked
+`Control Description (Baseline)` lookup and writes:
+
+- `Baseline Change Type` — `✅ No difference`, `🔎 Editorial change`, or
+  `🚨 Substantive change`.
+- `Baseline Change Suggestion` — the Control ID plus a concise explanation.
+
+**Input variables:** `supabaseKey` and `auditOverviewRecordId`. The latter is
+used only by the script to clear the checkbox trigger or surface an immediate
+HTTP error; the server resolves the authoritative overview row from the
+per-engagement key, so no record ID is trusted from the request.
+
+`Baseline Control ID` and `TSC Criteria` must be linked-record fields, and the
+linked tables' primary fields must hold the control IDs and criteria codes used
+in the CSV. The CSV `Owner` value is written according to the Airtable Owner
+field type reported by the script.
+
+If the folder or its CSV is missing, the overview `💬` field is set to exactly
+`Missing Client Control CSV`. When the CSV is found it shows
+`Uploading Client Controls`, then the analysis and completion status. Multiple
+matching folders or CSV files fail visibly instead of choosing one arbitrarily.
+
 ## `tick-controls-script.js` — runs **once per engagement** (step 2, STOPGAP)
 
 Ticks "Run V3 Audit" on every control, which fires the per-control script below
@@ -27,7 +64,7 @@ everything in budget it ticks the rest un-paced and reports `unpaced` > 0.
 > **This is only a stopgap.** Airtable's ~30s cap (and no `setTimeout`) means a
 > single run can't pace many controls to completion — it only spreads the initial
 > burst. For the real throttle use the `pace-controls` coordinator below. See
-> ADR-014 / `docs/BATCH_TEST_01.md`.
+> ADR-014.
 
 **Trigger:** an Airtable automation on the engagement table, *When a record
 matches conditions → `Run_All_V3_Audits` is checked*, running this script. The
@@ -63,8 +100,8 @@ Runs four calls **in order** (each depends on the previous one's DB writes):
    the `control_uuid` which all downstream calls use. **Hard fail.**
 2. `sync-control-evidence` — pull this control's Drive files → Storage → ingest.
    **Hard fail** (run-audit fails on empty evidence).
-3. `refine-control` — polish the control description. **Best-effort** (continue
-   on failure).
+3. `refine-control` — polish only the expected procedure; the original control
+   description is preserved. **Best-effort** (continue on failure).
 4. `run-audit` — returns a fast **202 ack** and runs the Opus/Sonnet pipeline in
    the **background** (it self-reports results back to Airtable when done). The
    script only waits for the ack, so it stays well under Airtable's ~30s script
@@ -128,7 +165,8 @@ sends those `control_uuid` values to the `sweep-stuck-jobs` function. The functi
 
 The master script (`register-engagement`) uses the shared `auditSecret` — it's the
 setup call that mints the per-engagement key. All per-control calls (`register-control`,
-`sync-control-evidence`, `refine-control`, `run-audit`) use `supabaseKey` instead.
+`sync-control-evidence`, `refine-control`, `run-audit`) and the engagement-level
+`c2c-analysis` call use `supabaseKey` instead.
 The key both authenticates the caller AND identifies which engagement the call belongs
 to — no `engagement_id` in the request body is needed. A leaked key only exposes one
 engagement, not all clients.

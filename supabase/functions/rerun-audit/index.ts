@@ -76,7 +76,7 @@ interface ControlRow {
   id: string;
   engagement_id: string;
   control_id: string;
-  refined_control_description: string | null;
+  control_description: string | null;
   refined_expected_procedure: string | null;
   refinement_status: string;
   airtable_record_id: string | null;
@@ -132,7 +132,7 @@ async function runConcurrent<T, R>(
 
 async function loadControl(tx: Sql, controlId: string): Promise<ControlRow | null> {
   const rows = await tx<ControlRow[]>`
-    select id, engagement_id, control_id, refined_control_description,
+    select id, engagement_id, control_id, control_description,
            refined_expected_procedure, refinement_status, airtable_record_id,
            latest_audit_run_id
     from controls
@@ -394,7 +394,7 @@ Deno.serve(async (req: Request) => {
     }
     if (
       loaded.c.refinement_status !== "refined" ||
-      !loaded.c.refined_control_description ||
+      !loaded.c.control_description ||
       !loaded.c.refined_expected_procedure
     ) {
       return jsonResponse(
@@ -518,7 +518,7 @@ Deno.serve(async (req: Request) => {
       // 3. Render the remediation prompt with the previous verdict + delta.
       const prompt = await loadActivePrompt(PROMPT_KEY);
       const userText = renderTemplate(prompt.user_prompt_template, {
-        control_description: control.refined_control_description!,
+        control_description: control.control_description!,
         expected_procedures: control.refined_expected_procedure!,
         attest_start: engagement.attest_start,
         attest_end: engagement.attest_end,
@@ -606,7 +606,7 @@ Deno.serve(async (req: Request) => {
       try {
         const wpPrompt = await loadActivePrompt(WORKPAPER_PROMPT_KEY);
         const wpUserText = renderTemplate(wpPrompt.user_prompt_template, {
-          control_description: control.refined_control_description!,
+          control_description: control.control_description!,
           expected_procedures: control.refined_expected_procedure!,
           conformity_determination: audit.conformity_determination,
           additional_comments: notes,

@@ -57,7 +57,6 @@ interface ControlRow {
   control_id: string;
   control_description: string | null;
   expected_procedures: string | null;
-  refined_control_description: string | null;
   refined_expected_procedure: string | null;
 }
 
@@ -78,7 +77,7 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 async function loadControl(tx: Sql, controlId: string): Promise<ControlRow | null> {
   const rows = await tx<ControlRow[]>`
     select id, engagement_id, control_id, control_description, expected_procedures,
-           refined_control_description, refined_expected_procedure
+           refined_expected_procedure
     from controls
     where id = ${controlId}
   `;
@@ -367,13 +366,13 @@ export async function ingestFile(args: IngestFileArgs): Promise<IngestFileResult
     );
 
     const ctx = {
-      control_description: control.refined_control_description ?? control.control_description ?? "",
+      control_description: control.control_description ?? "",
       expected_procedures: control.refined_expected_procedure ?? control.expected_procedures ?? "",
       tscs: tscsString,
       filename: args.filename,
     };
     if (!ctx.control_description) {
-      throw new Error("Control has no control_description (refined or raw)");
+      throw new Error("Control has no original control_description");
     }
     if (!ctx.expected_procedures) {
       throw new Error("Control has no expected_procedures (refined or raw)");
