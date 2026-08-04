@@ -4,9 +4,10 @@ import { callClaude } from "../_shared/claude-client.ts";
 import { loadActivePrompt } from "../_shared/load-prompt.ts";
 import { renderTemplate } from "../_shared/render-template.ts";
 import { completeJobRun, failJobRun, startJobRun } from "../_shared/job-run.ts";
-import { assertNotTruncated, parseClaudeJson } from "../_shared/claude-parse.ts";
+import { assertNotTruncated } from "../_shared/claude-parse.ts";
 import { resolveEngagementByKey } from "../_shared/auth.ts";
 import { patchAirtableRecord } from "../_shared/airtable.ts";
+import { parseRefinedExpectedProcedure } from "./refine-logic.ts";
 
 const FUNCTION_NAME = "refine-control";
 const PROMPT_KEY = "control_refiner";
@@ -26,31 +27,11 @@ interface ControlRow {
   airtable_record_id: string | null;
 }
 
-interface RefinedOutput {
-  Suggested_Control_Description: string;
-  Refined_Expected_Procedure: string;
-}
-
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "Content-Type": "application/json" },
   });
-}
-
-function parseRefined(raw: string): RefinedOutput {
-  // parseClaudeJson handles <scratchpad>, code fences, and bare JSON. The
-  // control_refiner prompt doesn't currently emit a scratchpad, but we use
-  // the shared parser for consistency and forward-compat.
-  const { parsed } = parseClaudeJson(raw);
-  const sug = parsed.Suggested_Control_Description;
-  const ref = parsed.Refined_Expected_Procedure;
-  if (typeof sug !== "string" || typeof ref !== "string") {
-    throw new Error(
-      `Claude output missing required string fields. Got keys: ${Object.keys(parsed).join(", ")}`,
-    );
-  }
-  return { Suggested_Control_Description: sug, Refined_Expected_Procedure: ref };
 }
 
 // All three loaders run on the engagement-scoped tx — RLS guarantees they can
@@ -178,14 +159,14 @@ Deno.serve(async (req: Request) => {
       max_tokens: prompt.max_tokens,
       context: `prompt_key=${prompt.prompt_key}`,
     });
-    const refined = parseRefined(claude.text);
+    const refined = parseRefinedExpectedProcedure(claude.text);
 
-    // Scoped write: persist the refinement and read back the Airtable base id in
-    // the same stamped transaction. The update's WITH CHECK is enforced by RLS.
+    // Persist only the expected-procedure refinement. Clear the legacy refined
+    // description so old AI wording can never be mistaken for the source control.
     const airtableBaseId = await withEngagementScope(engagementId, async (tx) => {
       await tx`
         update controls set
-          refined_control_description = ${refined.Suggested_Control_Description},
+          refined_control_description = null,
           refined_expected_procedure = ${refined.Refined_Expected_Procedure},
           refinement_status = 'refined',
           refined_at = now()
@@ -194,14 +175,14 @@ Deno.serve(async (req: Request) => {
       return await loadAirtableBaseId(tx, control.engagement_id);
     });
 
-    // Best-effort: mirror the refined fields back into the Airtable control row.
-    // Never fails the refine — the Supabase update above is the source of truth.
+    // Best-effort Airtable mirror. The legacy refined-description field is
+    // cleared so the original Control Description remains the only description.
     const airtableSync = await patchAirtableRecord({
       baseId: airtableBaseId,
       tableId: AIRTABLE_TABLE_ID,
       recordId: control.airtable_record_id,
       fields: {
-        V3_Refined__Control_Description: refined.Suggested_Control_Description,
+        V3_Refined__Control_Description: null,
         V3_Refined_Expected_Procedure: refined.Refined_Expected_Procedure,
       },
     });
@@ -218,8 +199,8 @@ Deno.serve(async (req: Request) => {
         input_tokens: claude.input_tokens,
         output_tokens: claude.output_tokens,
         stop_reason: claude.stop_reason,
-        refined_control_description_length: refined.Suggested_Control_Description.length,
         refined_expected_procedure_length: refined.Refined_Expected_Procedure.length,
+        control_description_source: "original",
         airtable_sync: airtableSync,
       },
     });
@@ -228,8 +209,8 @@ Deno.serve(async (req: Request) => {
       success: true,
       control_uuid: control.id,
       job_run_id: job.id,
-      refined_control_description: refined.Suggested_Control_Description,
       refined_expected_procedure: refined.Refined_Expected_Procedure,
+      control_description_source: "original",
       tokens: { input: claude.input_tokens, output: claude.output_tokens },
       airtable_sync: airtableSync,
     });

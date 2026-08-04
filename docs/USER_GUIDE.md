@@ -83,7 +83,7 @@ individual files before starting the audit.
 | You'll see | It means |
 |---|---|
 | 🤓 Reading control details… | Getting the control ready. |
-| ⏳ Polishing control description… | Tidying up the control's wording. |
+| ⏳ Polishing expected procedure… | Tidying the audit procedure. Your control's own wording is left exactly as written. |
 | 🔎 Pulling evidence… | Fetching the Airtable attachments or Google Drive files selected for this run. |
 | 📄 Reading your evidence… 🟩🟩🟩⬜⬜⬜ 3 of 9 files | Reading each file (the bar fills up as it goes). |
 | ☁️ Make is reading a large PDF… | A long PDF is being processed externally; this can take longer than ordinary files. |

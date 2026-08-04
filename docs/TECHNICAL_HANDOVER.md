@@ -75,6 +75,26 @@ git log -1 --oneline
 
 ## 4. End-to-end workflow
 
+### Client control import
+
+`c2c-analysis` runs once per engagement, before controls are audited.
+
+1. Airtable calls the function with the engagement key and returns immediately.
+2. The function locates the `Client Control` folder directly beneath the
+   engagement's stored Google Drive ID and requires exactly one CSV in it.
+3. It identifies the Control ID, Control Description, Criteria, and Owner
+   columns, and ignores evidence and status continuation rows.
+4. It upserts the Airtable controls table, keyed on the linked baseline control,
+   and writes the CSV control code into both the plain and linked fields.
+5. It sends each control's ID, current description, and baseline description to
+   Claude, which classifies the difference.
+6. It writes `Baseline Change Type` and `Baseline Change Suggestion` back to
+   each control row.
+
+A missing folder or CSV sets the Audit Overview `💬` field to
+`Missing Client Control CSV`. Multiple matching folders or CSV files fail
+visibly instead of selecting one arbitrarily.
+
 ### Initial audit
 
 1. Airtable calls `register-control`.
@@ -118,13 +138,14 @@ of ticking every control at once.
 
 ## 5. Edge functions
 
-The complete production system contains ten functions:
+The complete production system contains eleven functions:
 
 | Function | Authentication | Responsibility |
 |---|---|---|
 | `register-engagement` | Shared system secret | Upsert engagement, store Airtable/Drive identifiers, mint an engagement key |
+| `c2c-analysis` | Engagement key | Import the Client Control CSV, upsert Airtable controls, and classify baseline description changes |
 | `register-control` | Engagement key | Upsert control and TSC links |
-| `refine-control` | Engagement key | Refine control wording and expected procedures; write refined fields to Airtable |
+| `refine-control` | Engagement key | Refine the expected procedures only; the original control description is preserved |
 | `sync-control-evidence` | Engagement key | Select, store, extract, and finalize evidence; enqueue audit |
 | `make-extraction-callback` | Make callback secret | Complete or fail an external large-PDF job and resume its sync |
 | `audit-worker` | Shared system secret | Claim durable audit jobs and run the audit pipeline |
@@ -191,10 +212,16 @@ Therefore:
 - sync only the intended prompt when possible; and
 - verify that exactly one row for the prompt key is active.
 
-`control_refiner` v3.3 requires expected procedures to use past-tense
-audit-performance wording such as “Inquired” and “Inspected.” The Airtable
-write-back target for the refined control description is
-`V3_Refined__Control_Description`.
+`control_refiner` requires expected procedures to use past-tense
+audit-performance wording such as “Inquired” and “Inspected.” It now returns
+only the refined expected procedure. The original control description is
+preserved end to end, and `refine-control` clears the legacy
+`V3_Refined__Control_Description` field so earlier AI wording cannot be mistaken
+for the source control.
+
+`c2c_analysis` classifies each client control description against its baseline
+as no difference, an editorial change, or a substantive change. It receives only
+the control ID and the two descriptions.
 
 ## 9. Authentication, isolation, and secrets
 
@@ -259,8 +286,14 @@ Relevant fields include:
 - `V3_Results`
 - `V3_Done_At`
 - `V3_Cost_USD`
-- `V3_Refined__Control_Description`
+- `V3_Refined__Control_Description` (cleared by `refine-control`)
 - `V3_Refined_Expected_Procedure`
+- `Baseline Change Type`
+- `Baseline Change Suggestion`
+
+`c2c-analysis` additionally requires `Baseline Control ID` and `TSC Criteria` to
+be linked-record fields whose linked tables hold the control codes and criteria
+codes used in the CSV.
 
 The shared Airtable PATCH helper retries after removing unknown optional fields,
 but required schema changes still need coordinated testing.
