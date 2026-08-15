@@ -149,7 +149,8 @@ On the same control row:
 2. In **Re-run Audit 🤖**, pick the matching option:
    - *Run with Additional Evidence*, or
    - *Run with Additional Notes*, or
-   - *Run* (a full fresh re-check).
+   - *Run* (a full fresh re-check — use this after you edit the control's
+     description or expected procedures).
 3. ClearCheck re-checks the control, taking your new input into account, and updates the
    verdict.
 
@@ -157,6 +158,14 @@ The **Additional Evidence** and **Additional Notes** options are remediation
 passes: they reuse the prior conclusion and focus on the new material. The
 plain **Run** option is different—it performs a fresh evidence sync and audit
 for the existing control.
+
+Whichever you pick, ClearCheck uses the control's description and expected
+procedures **exactly as they read in Airtable right now** — it doesn't polish
+them again. Edits you make before a re-run are what gets audited.
+
+If the control has never been audited, there's no earlier verdict to revisit. In
+that case ClearCheck simply reads whatever you attached and gives you a first
+verdict, so you still get a result.
 
 ---
 

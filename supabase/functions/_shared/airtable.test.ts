@@ -82,7 +82,7 @@ Deno.test("retries a PATCH without an unknown field", async () => {
   }
 });
 
-Deno.test("reads one Airtable record with selected fields", async () => {
+Deno.test("reads one complete Airtable record without unsupported query parameters", async () => {
   const originalFetch = globalThis.fetch;
   const originalPat = Deno.env.get("AIRTABLE_PAT");
   let requestedUrl = "";
@@ -105,11 +105,10 @@ Deno.test("reads one Airtable record with selected fields", async () => {
       baseId: "appTest",
       tableId: "tblTest",
       recordId: "recTest",
-      fields: ["V3_Evidence"],
     });
     assertEquals(result.ok, true);
     assertEquals(result.record?.id, "recTest");
-    assertEquals(new URL(requestedUrl).searchParams.getAll("fields[]"), ["V3_Evidence"]);
+    assertEquals(new URL(requestedUrl).search, "");
   } finally {
     globalThis.fetch = originalFetch;
     if (originalPat === undefined) Deno.env.delete("AIRTABLE_PAT");

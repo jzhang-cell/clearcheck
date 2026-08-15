@@ -45,6 +45,7 @@ import {
 const FUNCTION_NAME = "c2c-analysis";
 const PROMPT_KEY = "c2c_analysis";
 const AIRTABLE_OVERVIEW_TABLE_ID = "tblrb4PpeCCIShcnl";
+const AIRTABLE_OVERVIEW_RECORD_ID = "recbN7FPFFMr3KxRw";
 const AIRTABLE_CONTROLS_TABLE_ID = "tblZrxDzOKd9FJkbC";
 const CLIENT_CONTROL_FOLDER = "Client Control";
 const AIRTABLE_BATCH_SIZE = 10;
@@ -306,6 +307,7 @@ async function resolveAndUpsertControls(args: {
       baselineRecordId: control.baseline_record_id,
       tscRecordIds: control.tsc_record_ids,
       ownerFieldType: args.ownerFieldType,
+      overviewRecordId: AIRTABLE_OVERVIEW_RECORD_ID,
     }),
   }));
   const updates = writes.filter((write) => Boolean(write.id));

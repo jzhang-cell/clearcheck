@@ -1,25 +1,22 @@
 // PER-CONTROL script — runs once per control (fired by "Run V3 Audit" being
 // ticked on a control record). Reference copy; Airtable runs its own copy.
 //
-// Runs four calls IN ORDER:
+// Runs three calls IN ORDER; sync queues run-audit after evidence is ready:
 //   0. register-control      — upsert the control + TSC links.        HARD FAIL.
-//   1. refine-control        — polish the expected procedure only.   BEST-EFFORT.
+//   1. refine-control        — polish the expected procedure only.   HARD FAIL.
 //   2. sync-control-evidence — Drive → Storage → ingest.              HARD FAIL.
-//   3. run-audit             — kicks the Opus/Sonnet pipeline in the BACKGROUND
-//      and returns a fast 202 ack. It writes its own results back to Airtable
-//      when done; we only await the quick ack here.                   HARD FAIL.
 //
-// Auth: uses supabaseKey (the per-engagement api_key saved by master-script.js).
+// Auth: uses supabaseKey (the per-engagement api_key saved by Make.com).
 // One leaked key only exposes this engagement, not all clients.
 //
 // Input variables:
 //   supabaseKey           — this engagement's api_key (from engagement record,
-//                           saved by master-script.js on first [Run V3] click)
+//                           saved by Make.com during registration)
 //   controlId             — the control's display code, e.g. "CC.01.02"
 //                           (maps to controls.control_id; NOT the UUID)
 //   companyControl        — (optional) company's own control name/number
 //   controlDescription    — (optional) what the control does
-//   expectedProcedures    — (optional) how it's tested
+//   expectedProcedures    — (required) how it's tested
 //   tscUuids              — (optional) JSON array of Supabase tscs.id UUIDs,
 //                           e.g. ["uuid-1","uuid-2"] — already stored in Airtable
 //   airtableControlRecordId — (optional) Airtable record id of this control row.
@@ -27,6 +24,13 @@
 //   controlTable          — (optional) the controls table name/id, so the script
 //                           can save control_uuid onto the record immediately
 //                           after register-control (before steps that can fail).
+//   evidenceExists       — (optional) map this input to the Airtable
+//                           `Evidence_exisit` lookup. Accepted ready values:
+//                           "exist", "exists", or "exsit" (including lookup arrays).
+//   v3Evidence           — (optional) map this input directly to the Airtable
+//                           `V3_Evidence` attachment field. When these two evidence
+//                           inputs are configured, the attachments are sent to sync
+//                           so it does not need an Airtable GET to choose its source.
 
 let config = input.config();
 // Hardcoded to the prod functions URL (was config.functionsBaseUrl, which threw
@@ -59,7 +63,11 @@ async function callFn(name, body) {
   });
   let text = await res.text();
   let result;
-  try { result = JSON.parse(text); } catch { result = { raw: text }; }
+  try {
+    result = JSON.parse(text);
+  } catch {
+    result = { raw: text };
+  }
   return { ok: res.ok, status: res.status, result, text };
 }
 
@@ -82,7 +90,11 @@ function parseTscUuids(raw) {
     if (s === "") return { list: [], hadContent: false };
     if (s.startsWith("[")) {
       // JSON array string.
-      try { candidates = JSON.parse(s); } catch { candidates = []; }
+      try {
+        candidates = JSON.parse(s);
+      } catch {
+        candidates = [];
+      }
     } else {
       // Delimiter-separated (rollup ARRAYJOIN): split on comma/newline/semicolon.
       candidates = s.split(/[,\n;]+/);
@@ -100,14 +112,47 @@ function parseTscUuids(raw) {
   return { list, hadContent };
 }
 
+// Airtable lookups can arrive as an array, a scalar, or a select-like object.
+// The field is intentionally only a cross-check: the attachment array below is
+// what gives sync the URLs and filenames it actually needs to ingest evidence.
+function lookupSaysEvidenceExists(raw) {
+  const values = Array.isArray(raw) ? raw : [raw];
+  return values.some((value) => {
+    const scalar = value && typeof value === "object" ? (value.name ?? value.value ?? "") : value;
+    const normalized = String(scalar ?? "").trim().toLowerCase();
+    return ["exist", "exists", "exsit", "yes", "true", "1"].includes(normalized);
+  });
+}
+
+function normalizeV3Evidence(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((file) => file && file.url && file.filename)
+    .map((file) => ({
+      ...(file.id ? { id: file.id } : {}),
+      url: file.url,
+      filename: file.filename,
+      ...(file.type ? { type: file.type } : {}),
+      ...(Number.isFinite(file.size) ? { size: file.size } : {}),
+    }));
+}
+
 let { list: tscUuidsArray, hadContent: tscHadContent } = parseTscUuids(config.tscUuids);
 if (tscHadContent && tscUuidsArray.length === 0) {
   throw new Error(
     `tscUuids was provided but no valid UUIDs were parsed from it ` +
-    `(value: ${JSON.stringify(config.tscUuids)}). Check the Airtable field — ` +
-    `a lookup of the TSC Supabase-UUID column is expected. Refusing to run ` +
-    `with zero TSC links (would degrade the audit).`
+      `(value: ${JSON.stringify(config.tscUuids)}). Check the Airtable field — ` +
+      `a lookup of the TSC Supabase-UUID column is expected. Refusing to run ` +
+      `with zero TSC links (would degrade the audit).`,
   );
+}
+if (
+  typeof config.expectedProcedures !== "string" ||
+  !config.expectedProcedures.trim()
+) {
+  const msg = "Expected Procedures is empty or is not mapped into the automation.";
+  await setStatus(`❌ ${msg}`);
+  throw new Error(msg);
 }
 
 await setStatus("🤓 Reading control details…");
@@ -115,12 +160,14 @@ let regCtrl = await callFn("register-control", {
   control_id: config.controlId,
   ...(config.companyControl ? { company_control: config.companyControl } : {}),
   ...(config.controlDescription ? { control_description: config.controlDescription } : {}),
-  ...(config.expectedProcedures ? { expected_procedures: config.expectedProcedures } : {}),
+  expected_procedures: config.expectedProcedures,
   ...(tscUuidsArray.length > 0 ? { tsc_uuids: tscUuidsArray } : {}),
   ...(config.airtableControlRecordId ? { airtable_record_id: config.airtableControlRecordId } : {}),
 });
 if (!regCtrl.ok) {
-  let msg = `register-control failed (HTTP ${regCtrl.status}): ${regCtrl.result.error || regCtrl.text}`;
+  let msg = `register-control failed (HTTP ${regCtrl.status}): ${
+    regCtrl.result.error || regCtrl.text
+  }`;
   await setStatus(`❌ ${msg}`);
   throw new Error(msg);
 }
@@ -148,19 +195,24 @@ if (config.controlTable && config.airtableControlRecordId) {
   // Loud so a missing input var doesn't silently leave control_uuid unsaved.
   console.warn(
     `control_uuid NOT written back — missing input var(s): ` +
-    `${!config.controlTable ? "controlTable " : ""}` +
-    `${!config.airtableControlRecordId ? "airtableControlRecordId" : ""}`.trim() +
-    `. Add them to the script step's input variables.`,
+      `${!config.controlTable ? "controlTable " : ""}` +
+      `${!config.airtableControlRecordId ? "airtableControlRecordId" : ""}`.trim() +
+      `. Add them to the script step's input variables.`,
   );
 }
 
-// ── 1. refine-control — BEST-EFFORT (continue on failure) ──────────────────
+// ── 1. refine-control — HARD FAIL ──────────────────────────────────────────
 await setStatus("⏳ Polishing expected procedure…");
 // Runs right after register because it needs no evidence. The original control
-// description is preserved; only the expected audit procedure is polished.
+// description is preserved; only the expected audit procedure is polished. A
+// failure must stop the run: register-control invalidates the prior refinement
+// whenever fresh Expected Procedures are supplied, so auditing cannot continue
+// with stale scope.
 let refine = await callFn("refine-control", { control_uuid: controlUuid });
 if (!refine.ok) {
-  console.warn(`refine-control failed (HTTP ${refine.status}): ${refine.result.error || refine.text} — continuing`);
+  let msg = `refine-control failed (HTTP ${refine.status}): ${refine.result.error || refine.text}`;
+  await setStatus(`❌ ${msg}`);
+  throw new Error(msg);
 }
 
 // ── 2. sync-control-evidence — kick the background job; await only the 202 ack ──
@@ -170,10 +222,37 @@ if (!refine.ok) {
 // could start) and no longer calls run-audit directly. sync OWNS its 💬
 // ("🔎 Pulling evidence…" → "✅ Evidence ready (N files)." → "❌ …");
 // run-audit owns the audit-phase 💬 once sync hands off.
-let sync = await callFn("sync-control-evidence", { control_uuid: controlUuid });
+const evidenceInputsConfigured = config.evidenceExists !== undefined ||
+  config.v3Evidence !== undefined;
+const evidenceExists = lookupSaysEvidenceExists(config.evidenceExists);
+const airtableEvidence = normalizeV3Evidence(config.v3Evidence);
+
+// A true lookup without attachment metadata usually means v3Evidence was not
+// added to the automation's input variables. Fail here instead of silently
+// switching to Drive and auditing the wrong evidence source.
+if (evidenceExists && airtableEvidence.length === 0) {
+  const msg = "Evidence_exisit says evidence exists, but no V3_Evidence attachments were passed. " +
+    "Map the automation input variable v3Evidence to the V3_Evidence field.";
+  await setStatus(`❌ ${msg}`);
+  throw new Error(msg);
+}
+
+let sync = await callFn("sync-control-evidence", {
+  control_uuid: controlUuid,
+  ...(evidenceInputsConfigured
+    ? {
+      evidence_exists: evidenceExists || airtableEvidence.length > 0,
+      airtable_evidence: airtableEvidence,
+    }
+    : {}),
+});
 if (!sync.ok) {
   // sync already wrote the ❌ to 💬; just stop the pipeline.
-  throw new Error(`sync-control-evidence failed to start (HTTP ${sync.status}): ${sync.result.error || sync.text}`);
+  throw new Error(
+    `sync-control-evidence failed to start (HTTP ${sync.status}): ${
+      sync.result.error || sync.text
+    }`,
+  );
 }
 
 // ── 3. run-audit is intentionally NOT called here ──────────────────────────

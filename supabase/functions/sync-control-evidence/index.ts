@@ -19,6 +19,7 @@ import { withEngagementScope } from "../_shared/scoped-db.ts";
 import { completeJobRun, failJobRun, startJobRun } from "../_shared/job-run.ts";
 import { checkSharedSecret, resolveEngagementByKey } from "../_shared/auth.ts";
 import { engagementSlug } from "../_shared/engagement-slug.ts";
+import { storageObjectFilename } from "../_shared/storage-object-name.ts";
 import {
   driveDownload,
   type DriveFile,
@@ -44,7 +45,9 @@ import {
   makeExternalStaleMs,
   summarizeExternalJobs,
 } from "../_shared/external-extraction.ts";
+import { controlCodesEqual } from "../_shared/control-code.ts";
 import { evidenceProgressMessage, summarizeEvidenceProgress } from "./progress-logic.ts";
+import { evidenceCompletionOutcome, reconcileFailedFilenames } from "./completion-logic.ts";
 
 const FUNCTION_NAME = "sync-control-evidence";
 const STORAGE_BUCKET = "evidence";
@@ -100,8 +103,9 @@ const SYNC_BUDGET_MS = Math.max(20_000, Number(Deno.env.get("SYNC_BUDGET_MS") ??
 
 // Hard ceiling on a SINGLE file's download → Storage upload → ingest. SYNC_BUDGET_MS
 // only gates LAUNCHING new files; it does NOT bound a file already in flight. With this,
-// a hung file is marked "failed" (reason surfaced) and the remaining files, the self-chain,
-// and the audit all proceed instead of the control freezing mid-progress-bar.
+// a hung file is marked "failed" (reason surfaced) and the remaining files + self-chain
+// proceed instead of the control freezing mid-progress-bar. The final completion gate
+// blocks the audit until every current-source failure has been resolved.
 // Raised 80s → 150s so genuinely SLOW-but-valid files finish and make the audit — a big
 // 100+ page PDF (chunk + aggregate) legitimately needs ~2-2.5 min, and at 80s it was always
 // timed out + skipped. A truly HUNG call is still caught earlier by the 60s per-call abort
@@ -393,6 +397,13 @@ async function finalizeControlEvidence(args: {
 interface RequestPayload {
   control_uuid: string; // controls.id (UUID)
   trigger_source?: string;
+  // Optional snapshot supplied by the Airtable automation. Presence matters:
+  // an explicitly empty array selects the Google Drive fallback, while omission
+  // keeps recovery/manual callers compatible by reading the Airtable record.
+  airtable_evidence?: unknown;
+  // Lookup hint from Airtable's `Evidence_exisit` field. This is a consistency
+  // check only; attachment URLs still come from `airtable_evidence`.
+  evidence_exists?: boolean;
   // Internal, set only by the self-chain: filenames that already FAILED during
   // this sync cycle. Chained runs skip them so the cycle converges — without
   // this, a failing file was re-attempted on EVERY chain link, and if the
@@ -401,6 +412,13 @@ interface RequestPayload {
   // CC.06.25 indefinitely). A FRESH trigger (Airtable/manual) never sets this,
   // so pressing Re-run still retries everything (e.g. after replacing a file).
   chain_failed?: string[];
+  // Source filenames completed during earlier links but not discoverable from
+  // evidence_files.filename (notably byte-identical uploads with different
+  // names, which intentionally share one canonical evidence_files row).
+  chain_handled?: string[];
+  // Zip files are handled once but carried to the final completion gate so a
+  // later chain link cannot accidentally forget them and launch an audit.
+  chain_zips?: string[];
   // Internal, set only by the self-chain: how many links deep this cycle is.
   chain_depth?: number;
   // Durable orchestration id carried across self-chains and Make callbacks.
@@ -598,6 +616,22 @@ async function loadExternalJobSummary(syncRunId: string) {
   );
 }
 
+async function loadReadyFilenames(
+  engagementId: string,
+  controlId: string,
+): Promise<Set<string>> {
+  return await withEngagementScope(engagementId, async (tx) => {
+    const rows = await tx<{ filename: string }[]>`
+      select distinct ef.filename
+      from evidence_control_links l
+      join evidence_files ef on ef.id = l.evidence_file_id
+      join extracted_evidence ee on ee.evidence_file_id = ef.id
+      where l.control_id = ${controlId}
+    `;
+    return new Set(rows.map((row) => row.filename));
+  });
+}
+
 // Fire-and-forget call to a sibling edge function, forwarding the inbound
 // per-engagement key. Used to (a) chain to run-audit once evidence is ready, and
 // (b) self-chain — re-invoke THIS function to continue ingesting when a big control
@@ -646,6 +680,24 @@ Deno.serve(async (req: Request) => {
   if (typeof payload.control_uuid !== "string" || !payload.control_uuid) {
     return jsonResponse({ error: "Missing or invalid 'control_uuid'" }, 400);
   }
+  const airtableEvidenceSupplied = Object.prototype.hasOwnProperty.call(
+    payload,
+    "airtable_evidence",
+  );
+  if (airtableEvidenceSupplied && !Array.isArray(payload.airtable_evidence)) {
+    return jsonResponse({ error: "'airtable_evidence' must be an array when supplied" }, 400);
+  }
+  if (payload.evidence_exists !== undefined && typeof payload.evidence_exists !== "boolean") {
+    return jsonResponse({ error: "'evidence_exists' must be a boolean when supplied" }, 400);
+  }
+  if (
+    payload.evidence_exists === true &&
+    (!airtableEvidenceSupplied || (payload.airtable_evidence as unknown[]).length === 0)
+  ) {
+    return jsonResponse({
+      error: "Evidence_exisit says evidence exists, but no V3_Evidence attachments were supplied",
+    }, 400);
+  }
   const internalResume = payload.internal_resume === true;
   let engagementId: string;
   if (internalResume) {
@@ -670,6 +722,16 @@ Deno.serve(async (req: Request) => {
   const chainFailed = new Set<string>(
     Array.isArray(payload.chain_failed)
       ? payload.chain_failed.filter((n): n is string => typeof n === "string")
+      : [],
+  );
+  const chainHandled = new Set<string>(
+    Array.isArray(payload.chain_handled)
+      ? payload.chain_handled.filter((n): n is string => typeof n === "string")
+      : [],
+  );
+  const chainZips = new Set<string>(
+    Array.isArray(payload.chain_zips)
+      ? payload.chain_zips.filter((n): n is string => typeof n === "string")
       : [],
   );
   const chainDepth = Number.isFinite(payload.chain_depth) ? Number(payload.chain_depth) : 0;
@@ -748,6 +810,11 @@ Deno.serve(async (req: Request) => {
         control_id: control.control_id,
         sync_run_id: syncRun.id,
         internal_resume: internalResume,
+        airtable_evidence_supplied: airtableEvidenceSupplied,
+        airtable_evidence_count: Array.isArray(payload.airtable_evidence)
+          ? payload.airtable_evidence.length
+          : null,
+        evidence_exists: payload.evidence_exists ?? null,
       },
       engagement_id: control.engagement_id,
     });
@@ -778,23 +845,26 @@ Deno.serve(async (req: Request) => {
     );
 
     try {
-      // 1. Read V3_Evidence from the Airtable control record. If it contains
-      // attachments, those files are the complete source for this sync and Drive
-      // is not listed or downloaded. Missing Airtable metadata keeps the legacy
-      // Drive-only path available for non-Airtable callers.
-      const airtableRecord = await getAirtableRecord({
-        baseId: airtableBase,
-        tableId: AIRTABLE_CONTROLS_TABLE_ID,
-        recordId: control.airtable_record_id,
-        fields: ["V3_Evidence"],
-      });
-      if (!airtableRecord.ok) {
-        throw new Error(
-          `Could not check Airtable V3_Evidence before selecting an evidence source: ` +
-            `${airtableRecord.error ?? "unknown Airtable error"}`,
-        );
+      // 1. Prefer the attachment snapshot supplied by the Airtable automation.
+      // Recovery/manual callers omit it, so they fall back to a valid full-record
+      // GET (the single-record endpoint does not accept `fields[]`).
+      let v3EvidenceRaw: unknown;
+      if (airtableEvidenceSupplied) {
+        v3EvidenceRaw = payload.airtable_evidence;
+      } else {
+        const airtableRecord = await getAirtableRecord({
+          baseId: airtableBase,
+          tableId: AIRTABLE_CONTROLS_TABLE_ID,
+          recordId: control.airtable_record_id,
+        });
+        if (!airtableRecord.ok) {
+          throw new Error(
+            `Could not check Airtable V3_Evidence before selecting an evidence source: ` +
+              `${airtableRecord.error ?? "unknown Airtable error"}`,
+          );
+        }
+        v3EvidenceRaw = airtableRecord.record?.fields.V3_Evidence;
       }
-      const v3EvidenceRaw: unknown = airtableRecord.record?.fields.V3_Evidence;
       const airtableAttachments = parseAirtableEvidenceAttachments(v3EvidenceRaw);
       const v3EvidenceIsNonEmpty = Array.isArray(v3EvidenceRaw)
         ? v3EvidenceRaw.length > 0
@@ -840,7 +910,9 @@ Deno.serve(async (req: Request) => {
           token,
           `'${evidenceFolderId}' in parents and mimeType = '${FOLDER_MIME}' and trashed = false`,
         );
-        const match = subfolders.find((f) => f.name.split("-")[0].trim() === control.control_id);
+        const match = subfolders.find((f) =>
+          controlCodesEqual(f.name.split("-")[0], control.control_id)
+        );
         if (!match) {
           // Friendly user-facing 💬 — short and actionable. The full list of folders
           // we DID find stays in the job log (failJobRun) for debugging, not in the 💬.
@@ -912,16 +984,18 @@ Deno.serve(async (req: Request) => {
       // 3b. Skip files already ingested for THIS control (prior run / earlier chain),
       //     so we don't re-download them. This makes self-chaining converge: each run
       //     only touches the files still pending.
-      const doneNames = await withEngagementScope(control.engagement_id, async (tx) => {
-        const rows = await tx<{ filename: string }[]>`
-        select distinct ef.filename
-        from evidence_control_links l
-        join evidence_files ef on ef.id = l.evidence_file_id
-        join extracted_evidence ee on ee.evidence_file_id = ef.id
-        where l.control_id = ${control.id}
-      `;
-        return new Set(rows.map((r) => r.filename));
-      });
+      const doneNames = await loadReadyFilenames(control.engagement_id, control.id);
+      // A timed-out extraction is not cancelled by Promise.race and can finish
+      // after its worker reports failure. Clear carried failures that are now
+      // visibly linked+extracted before deciding what remains pending.
+      const carriedReconciliation = reconcileFailedFilenames(chainFailed, doneNames);
+      chainFailed.clear();
+      for (const name of carriedReconciliation.unresolved) chainFailed.add(name);
+      if (carriedReconciliation.resolvedLate.length > 0) {
+        console.info(
+          `Late extraction completed for ${carriedReconciliation.resolvedLate.join(", ")}`,
+        );
+      }
       // Light files first, heavyweights last: quick wins land early, and the
       // heavy tail defers cleanly to the self-chain (see PDF_HEAVY_BYTES).
       const isHeavyFile = (f: DriveFile) => {
@@ -931,7 +1005,7 @@ Deno.serve(async (req: Request) => {
         return (f.size ?? 0) >= GENERIC_HEAVY_BYTES;
       };
       const pending = files
-        .filter((f) => !doneNames.has(f.name))
+        .filter((f) => !doneNames.has(f.name) && !chainHandled.has(f.name))
         // Skip files that already failed earlier in THIS chain cycle — retrying
         // them every link burned the whole budget and made the chain loop forever.
         .filter((f) => !chainFailed.has(f.name))
@@ -941,7 +1015,9 @@ Deno.serve(async (req: Request) => {
       // self-chained runs: total = every file in the folder, done = already-ingested
       // (prior runs/chains) + completed this run — so the bar keeps advancing run to run.
       const totalFiles = files.length;
-      const doneBefore = files.filter((file) => doneNames.has(file.name)).length;
+      const doneBefore = files.filter((file) =>
+        doneNames.has(file.name) || chainHandled.has(file.name)
+      ).length;
       let lastBarShown = -1; // monotonic guard so out-of-order PATCHes can't go backward
       await setStatus(
         airtableBase,
@@ -962,7 +1038,7 @@ Deno.serve(async (req: Request) => {
 
       const processOneFile = async (f: SyncEvidenceFile): Promise<IngestFileResult> => {
         const fileStart = Date.now();
-        const storagePath = `${slug}/${control.control_id}/${f.name}`;
+        const storagePath = `${slug}/${control.control_id}/${storageObjectFilename(f.name)}`;
 
         if (isZip(f)) {
           zipFiles.push(f.name);
@@ -1174,6 +1250,7 @@ Deno.serve(async (req: Request) => {
         deferred,
         total_ready: totalReady,
         total_files: files.length,
+        resolved_late: 0,
       };
       const tokens = { input: totalInput, output: totalOutput, embedding: totalEmbedding };
       const duration_ms = Date.now() - startTime;
@@ -1223,10 +1300,21 @@ Deno.serve(async (req: Request) => {
         const failedThisRun = results
           .filter((r) => r.status === "failed" && r.filename)
           .map((r) => r.filename as string);
+        const handledThisRun = results
+          .filter((r) => r.status !== "failed")
+          .map((r) => r.filename);
         const chained = await triggerFunction("sync-control-evidence", inboundKey, control.id, {
           chain_failed: [...chainFailed, ...failedThisRun],
+          chain_handled: [...chainHandled, ...handledThisRun],
+          chain_zips: [...chainZips, ...zipFiles],
           chain_depth: chainDepth + 1,
           sync_run_id: syncRun.id,
+          ...(airtableEvidenceSupplied
+            ? {
+              airtable_evidence: payload.airtable_evidence,
+              evidence_exists: payload.evidence_exists,
+            }
+            : {}),
           ...(internalResume
             ? { internal_resume: true, engagement_id: control.engagement_id }
             : {}),
@@ -1331,12 +1419,31 @@ Deno.serve(async (req: Request) => {
         summary.total_ready = totalReady;
       }
 
+      // Re-read exact filenames after all local/external work. This reconciles a
+      // Promise.race timeout whose underlying extraction committed just after the
+      // timeout result, preventing a false partial-failure report.
+      const finalReadyNames = await loadReadyFilenames(control.engagement_id, control.id);
+      totalReady = await countReadyEvidence();
+      summary.total_ready = totalReady;
+      const failedThisRun = results
+        .filter((r) => r.status === "failed")
+        .map((r) => r.filename);
+      const failureReconciliation = reconcileFailedFilenames(
+        [...chainFailed, ...failedThisRun],
+        finalReadyNames,
+      );
+      const unresolvedFailures = new Set(failureReconciliation.unresolved);
+      failed = unresolvedFailures.size;
+      summary.failed = failed;
+      summary.resolved_late = failureReconciliation.resolvedLate.length;
+      const allZipFiles = [...new Set([...chainZips, ...zipFiles])];
+
       // Aggregate the DISTINCT per-file failure reasons (with counts) so both the
       // 💬 and the job_runs row say WHY files failed — not just "N files failed".
       // Without this the reason lived only in the function logs.
       const reasonCounts = new Map<string, number>();
       for (const r of results) {
-        if (r.status === "failed" && r.error) {
+        if (r.status === "failed" && unresolvedFailures.has(r.filename) && r.error) {
           const key = r.error.length > 140 ? `${r.error.slice(0, 140)}…` : r.error;
           reasonCounts.set(key, (reasonCounts.get(key) ?? 0) + 1);
         }
@@ -1346,55 +1453,38 @@ Deno.serve(async (req: Request) => {
         .join(" | ");
       // Failures carried from earlier links of this chain cycle (their reasons were
       // reported on those runs; here we surface the names so the count adds up).
-      if (chainFailed.size > 0) {
-        const carried = `${chainFailed.size} failed in earlier passes: ${
-          [...chainFailed].join(", ")
+      const unresolvedCarried = [...chainFailed].filter((name) => unresolvedFailures.has(name));
+      if (unresolvedCarried.length > 0) {
+        const carried = `${unresolvedCarried.length} failed in earlier passes: ${
+          unresolvedCarried.join(", ")
         }`;
         failureReasons = failureReasons ? `${failureReasons} | ${carried}` : carried;
-        failed += chainFailed.size;
       }
 
-      // All pending files attempted this run — build the final status.
-      let statusMsg: string;
-      if (totalReady > 0) {
-        statusMsg = `✅ Evidence ready (${totalReady} file${plural(totalReady)}).`;
-        if (failed > 0) statusMsg += ` ⚠️ ${failed} file${plural(failed)} failed.`;
-        if (zipFiles.length > 0) {
-          statusMsg += ` ⚠️ Skipped ${zipFiles.length} zip file${plural(zipFiles.length)} ` +
-            `— please unzip & re-upload: ${zipFiles.join(", ")}.`;
-        }
-      } else if (zipFiles.length > 0) {
-        statusMsg = `📦 Only zip file${plural(zipFiles.length)} found ` +
-          `(${zipFiles.join(", ")}). Please unzip the evidence in ${sourceName} and re-run.`;
-      } else if (failed > 0) {
-        statusMsg =
-          `❌ Evidence could not be processed (${failed} file${plural(failed)} failed). ` +
-          (failureReasons
-            ? `Reason: ${failureReasons}`
-            : `Check the files in ${sourceName} and re-run.`);
-      } else {
-        statusMsg = `📭 No evidence files found.`;
-      }
-      await setStatus(airtableBase, control.airtable_record_id, statusMsg);
+      // Audit only a complete current source. Previously `totalReady > 0` was
+      // enough, so a 29/30 run could silently audit the partial set.
+      const completion = evidenceCompletionOutcome({
+        uniqueReady: totalReady,
+        sourceFiles: files.length,
+        failed,
+        zipFiles: allZipFiles,
+        failureReasons,
+      });
+      await setStatus(airtableBase, control.airtable_record_id, completion.statusMessage);
 
-      // Nothing usable (only zips / all failed) — halt 422 so run-audit doesn't run empty.
-      if (totalReady === 0) {
-        const noEvidenceError = zipFiles.length > 0
-          ? `No usable evidence — only zip file(s): ${zipFiles.join(", ")}`
-          : `No usable evidence — ${failed} file(s) failed. Reasons: ${
-            failureReasons || "(none captured)"
-          }`;
+      if (!completion.auditReady) {
+        const completionError = completion.errorMessage ?? "Evidence sync incomplete";
         await failJobRun({
           handle: job,
-          error_message: noEvidenceError,
+          error_message: completionError,
         });
         await updateSyncRun(syncRun.id, {
           status: "failed",
-          error_message: noEvidenceError,
+          error_message: completionError,
           completed_at: new Date().toISOString(),
         });
         return jsonResponse({
-          error: statusMsg,
+          error: completion.statusMessage,
           control_uuid: control.id,
           ...sourceResult,
           total_files: files.length,

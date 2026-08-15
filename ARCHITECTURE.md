@@ -162,7 +162,7 @@ collection. Large-PDF sub-jobs live in `external_extraction_jobs`.
 
 | Function | Category |
 |---|---|
-| `register-engagement` | Setup |
+| `register-engagement` | Setup (called by the Make.com onboarding scenario) |
 | `c2c-analysis` | Control import and baseline comparison |
 | `register-control` | Setup |
 | `refine-control` | AI refinement |
