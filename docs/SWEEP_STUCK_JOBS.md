@@ -157,8 +157,8 @@ everyone believed the cron "was never set up".
 
 > **Rule: whenever `AUDIT_SHARED_SECRET` is rotated, also run:**
 > `select vault.update_secret((select id from vault.secrets where name='audit_shared_secret'), '<new value>');`
-> (The shared secret is also used by the Airtable Register Engagement setup
-> script. The new bad-control sweep script uses `supabaseKey`, not this shared
+> (The shared secret is also used by Make's Register Engagement request during
+> onboarding. The bad-control sweep script uses `supabaseKey`, not this shared
 > secret.)
 
 ## How to check it's alive

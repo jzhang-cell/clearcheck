@@ -334,7 +334,6 @@ async function verifyOneRecoveryMonitor(
         baseId: airtableBase,
         tableId: AIRTABLE_CONTROLS_TABLE_ID,
         recordId: control.airtable_record_id,
-        fields: [CONTROL_STATUS_FIELD],
       });
       return {
         control_uuid: control.control_uuid,

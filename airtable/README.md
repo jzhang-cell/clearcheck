@@ -10,11 +10,24 @@ The end-to-end flow is the ADR-012 Drive-driven `[Run V3]` button.
 
 ## `master-script.js` — runs **once per engagement** (step 1)
 
-1. Calls `register-engagement` (upsert) with the shared secret.
-2. Saves the returned `engagement_id` → `supabase_uuid`, and (create only) the
-   returned `api_key` → `supabase_key`.
-3. **Checks `Run_All_V3_Audits`** on the engagement record (last, as its own
-   write). That checkbox is the trigger for the tick-controls automation below.
+**Registration now happens in Make.com, not here.** The Make onboarding scenario
+calls `register-engagement` during onboarding and saves the returned
+`supabase_uuid` and — on creation only — the per-engagement `supabase_key` onto
+the Audit Overview row. Make already holds the client metadata, attestation
+dates, Drive IDs, and Airtable identifiers that endpoint needs.
+
+This script therefore starts the run rather than registering it:
+
+1. Verifies the Audit Overview row already has both `supabase_uuid` and
+   `supabase_key`, and stops with a clear `💬` message if either is missing.
+2. **Checks `Run_All_V3_Audits`** on that row. That checkbox is the trigger for
+   the tick-controls automation below.
+
+**Required inputs:** `engagementTable`, `engagementRecordId`.
+
+> Make must preserve the existing key whenever an idempotent update response
+> omits `api_key`. The plaintext is returned only on creation and cannot be
+> recovered from its stored hash.
 
 ## `c2c-analysis-script.js` — import and compare the client's controls
 
@@ -68,9 +81,10 @@ everything in budget it ticks the rest un-paced and reports `unpaced` > 0.
 
 **Trigger:** an Airtable automation on the engagement table, *When a record
 matches conditions → `Run_All_V3_Audits` is checked*, running this script. The
-master script sets that checkbox last, so registration + UUID/key are committed
-before any control starts syncing evidence. (Reset `Run_All_V3_Audits` to
-unchecked afterward, or the next run won't re-trigger.)
+master script checks that box only after confirming the UUID and key Make saved
+during onboarding, so both are present before any control starts syncing
+evidence. (Reset `Run_All_V3_Audits` to unchecked afterward, or the next run
+won't re-trigger.)
 
 ## `tick-controls-via-coordinator.js` — runs **once per engagement** (step 2, DURABLE)
 
@@ -130,17 +144,23 @@ value*. The script CLEARS the field first (momentary button) and then branches o
 the **selected option**:
 
 - **`run`** → **FULL re-run**: re-pulls Drive evidence and re-audits, like the
-  "Run V3 Audit" checkbox — but it **skips `register-control` / `refine-control`**
-  because the control already exists in Supabase (description, expected procedures,
-  TSC links, `control_uuid` all persisted from the initial run). It just calls
-  `sync-control-evidence(control_uuid)`, which re-pulls/resumes the files and chains
-  to `run-audit` itself. Use this to restart a control from scratch (e.g. one
-  **stuck mid-ingest**) in one click, no checkbox clear-and-recheck.
+  "Run V3 Audit" checkbox. It calls `register-control` with the current Airtable
+  Control Description and Expected Procedures, marked as final, then
+  `sync-control-evidence(control_uuid)`, which re-pulls the files and chains to
+  the audit. Use this after editing a control's scope, or to restart a control
+  that is **stuck mid-ingest**, in one click.
 - **`run with Additional Evidence`** → remediation, `mode=evidence` via `rerun-audit`.
 - **`run with Additional Notes`** → remediation, `mode=notes` via `rerun-audit`.
 
+Every re-run sends the current Control Description and Expected Procedures and
+uses them exactly as supplied — `refine-control` is not called again, because
+those inputs are already auditor-approved.
+
 The remediation path re-judges against the previous verdict + newly-staged
 evidence/notes and does **not** re-pull Drive; the full path re-pulls everything.
+If the control has **no previous verdict**, remediation is not possible: the
+staged files are ingested and the standard audit runs over them instead, so the
+control still receives a first result rather than an error.
 
 **Input variables for the automation's script step** (both flows share the same
 small set — no extra control fields are needed since the control already exists):
@@ -163,8 +183,10 @@ sends those `control_uuid` values to the `sweep-stuck-jobs` function. The functi
 
 ## Auth note
 
-The master script (`register-engagement`) uses the shared `auditSecret` — it's the
-setup call that mints the per-engagement key. All per-control calls (`register-control`,
+Make's onboarding scenario calls `register-engagement` with the shared setup
+secret — that's the call that mints the per-engagement key. The shared secret
+lives in Supabase and Make's secured HTTP credentials; it is never stored in
+Airtable. All per-control calls (`register-control`,
 `sync-control-evidence`, `refine-control`, `run-audit`) and the engagement-level
 `c2c-analysis` call use `supabaseKey` instead.
 The key both authenticates the caller AND identifies which engagement the call belongs
@@ -182,6 +204,7 @@ in practice, that's the trigger to pull forward the async-queue ticket
 
 ## Current auth boundary (ADR-011)
 
-`register-engagement` uses the shared setup secret. Per-control calls and the
-bad-control recovery mode use the engagement's own `supabaseKey`; the key both
-authenticates the call and limits it to that engagement.
+`register-engagement` uses the shared setup secret, sent by Make during
+onboarding. Per-control calls and the bad-control recovery mode use the
+engagement's own `supabaseKey`; the key both authenticates the call and limits it
+to that engagement.

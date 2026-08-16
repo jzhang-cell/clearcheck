@@ -7,10 +7,10 @@
 // continue server-side after the function returns its 202 acknowledgement.
 //
 // Required automation input:
-//   supabaseKey — the engagement's per-engagement key from [supabase_key]
+//   auditOverviewRecordId — the triggering Audit Overview record ID
 //
-// Trigger record: the current Audit Overview row. The function resolves that row
-// from the key, so no record ID is trusted from the script request.
+// The script reads the already-created per-engagement key directly from the
+// trigger record's [supabase_key] field, so it does not need a supabaseKey input.
 
 let config = input.config();
 const BASE = "https://kwuymtlpjkziqkumixvk.supabase.co/functions/v1";
@@ -18,29 +18,45 @@ const OVERVIEW_TABLE_ID = "tblrb4PpeCCIShcnl";
 const CONTROLS_TABLE_ID = "tblZrxDzOKd9FJkbC";
 const TRIGGER_FIELD = "C2C Analysis";
 const STATUS_FIELD = "💬";
+const SUPABASE_KEY_FIELD = "supabase_key";
 
 const overviewTable = base.getTable(OVERVIEW_TABLE_ID);
 const controlsTable = base.getTable(CONTROLS_TABLE_ID);
 
-if (!config.supabaseKey || String(config.supabaseKey).trim() === "") {
-  throw new Error("supabaseKey is missing. Map it from the Audit Overview record.");
+function normalizeFieldName(name) {
+  return String(name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function linkedTableDetails(fieldName) {
+function linkedTableDetails(fieldName, preferredMatchFields = []) {
   const field = controlsTable.getField(fieldName);
   const linkedTableId = field.options && field.options.linkedTableId;
   if (field.type !== "multipleRecordLinks" || !linkedTableId) {
     throw new Error(`[${fieldName}] must be an Airtable linked-record field.`);
   }
   const linkedTable = base.getTable(linkedTableId);
+  const preferredNames = preferredMatchFields.map(normalizeFieldName);
+  const preferredField = linkedTable.fields.find((candidate) =>
+    preferredNames.includes(normalizeFieldName(candidate.name))
+  );
+  // Airtable's automation runtime may not expose Table.primaryField even
+  // though the scripting extension does. The primary field is always the
+  // first entry in Table.fields, so use it as the compatible fallback.
+  const matchField = preferredField || linkedTable.primaryField || linkedTable.fields[0];
+  if (!matchField) {
+    throw new Error(`Could not read a match field for linked table ${linkedTable.name}.`);
+  }
   return {
     tableId: linkedTable.id,
-    matchField: linkedTable.primaryField.name,
+    matchField: matchField.name,
   };
 }
 
 const baseline = linkedTableDetails("Baseline Control ID");
-const criteria = linkedTableDetails("TSC Criteria");
+const criteria = linkedTableDetails("TSC Criteria", [
+  "tsc_code",
+  "TSC Code",
+  "Criteria Code",
+]);
 const ownerField = controlsTable.getField("Owner");
 
 let triggerRecordId = config.auditOverviewRecordId;
@@ -51,11 +67,26 @@ if (!triggerRecordId) {
 }
 
 try {
+  const overviewRecord = await overviewTable.selectRecordAsync(triggerRecordId);
+  if (!overviewRecord) {
+    throw new Error(`Audit Overview record ${triggerRecordId} was not found.`);
+  }
+  const supabaseKey = String(
+    overviewRecord.getCellValueAsString(SUPABASE_KEY_FIELD) || "",
+  ).trim();
+  if (!supabaseKey) {
+    const message = "Register the engagement before running C2C Analysis.";
+    await overviewTable.updateRecordAsync(triggerRecordId, {
+      [STATUS_FIELD]: `❌ ${message}`,
+    });
+    throw new Error(message);
+  }
+
   const response = await fetch(`${BASE}/c2c-analysis`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-audit-secret": config.supabaseKey,
+      "x-audit-secret": supabaseKey,
     },
     body: JSON.stringify({
       baseline_table_id: baseline.tableId,

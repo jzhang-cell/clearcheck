@@ -138,7 +138,7 @@ async function linkFileToControl(
   `;
 }
 
-async function insertEvidenceFile(
+async function insertOrGetEvidenceFile(
   tx: Sql,
   args: {
     engagement_id: string;
@@ -149,7 +149,7 @@ async function insertEvidenceFile(
     mime_type: string;
     storage_path: string;
   },
-): Promise<{ id: string }> {
+): Promise<{ id: string; inserted: boolean }> {
   const [row] = await tx<{ id: string }[]>`
     insert into evidence_files
       (engagement_id, file_hash, filename, file_type, file_size_bytes, mime_type,
@@ -157,10 +157,19 @@ async function insertEvidenceFile(
     values
       (${args.engagement_id}, ${args.file_hash}, ${args.filename}, ${args.file_type},
        ${args.file_size_bytes}, ${args.mime_type}, ${args.storage_path}, 'processing')
+    on conflict (engagement_id, file_hash) do nothing
     returning id
   `;
-  if (!row) throw new Error("Failed to insert evidence_files: no row returned");
-  return row;
+  if (row) return { id: row.id, inserted: true };
+
+  // Another worker inserted the same content between our initial dedupe read
+  // and this write. The unique index is the source of truth: reuse that row
+  // instead of surfacing a duplicate-key failure to the auditor.
+  const existing = await findExistingFile(tx, args.engagement_id, args.file_hash);
+  if (!existing) {
+    throw new Error("Evidence dedupe conflict occurred but the existing row could not be loaded");
+  }
+  return { id: existing.id, inserted: false };
 }
 
 async function updateEvidenceFileStatus(
@@ -173,6 +182,23 @@ async function updateEvidenceFileStatus(
     update evidence_files
     set status = ${status}, error_message = ${errorMessage}
     where id = ${id}
+  `;
+}
+
+async function markEvidenceFileFailedUnlessExtracted(
+  tx: Sql,
+  id: string,
+  errorMessage: string,
+): Promise<void> {
+  // A concurrent worker can finish the shared file after this worker fails.
+  // Never overwrite that successful terminal state with a late failure.
+  await tx`
+    update evidence_files ef
+    set status = 'failed', error_message = ${errorMessage}
+    where ef.id = ${id}
+      and not exists (
+        select 1 from extracted_evidence ee where ee.evidence_file_id = ef.id
+      )
   `;
 }
 
@@ -310,17 +336,56 @@ export async function ingestFile(args: IngestFileArgs): Promise<IngestFileResult
     // PARTIAL row (set in the dedupe block above), in which case we keep its id and
     // just re-run the extraction below.
     if (!evidenceFileId) {
-      const evidenceFile = await withEngagementScope(engagementId, (tx) =>
-        insertEvidenceFile(tx, {
-          engagement_id: engagementId,
-          file_hash: fileHash,
-          filename: args.filename,
-          file_type: fileType,
-          file_size_bytes: args.file_bytes.length,
-          mime_type: mimeTypeFor(args.filename),
-          storage_path: args.file_path,
-        }));
+      const evidenceFile = await withEngagementScope(
+        engagementId,
+        (tx) =>
+          insertOrGetEvidenceFile(tx, {
+            engagement_id: engagementId,
+            file_hash: fileHash,
+            filename: args.filename,
+            file_type: fileType,
+            file_size_bytes: args.file_bytes.length,
+            mime_type: mimeTypeFor(args.filename),
+            storage_path: args.file_path,
+          }),
+      );
       evidenceFileId = evidenceFile.id;
+
+      if (!evidenceFile.inserted) {
+        // A concurrent worker won the file-hash insert. Always attach the shared
+        // row to this control, then reuse its extraction if it already landed.
+        const completed = await withEngagementScope(engagementId, async (tx) => {
+          await linkFileToControl(tx, evidenceFile.id, args.control_id);
+          const rows = await tx<{ n: number }[]>`
+            select count(*)::int as n
+            from extracted_evidence
+            where evidence_file_id = ${evidenceFile.id}
+          `;
+          return rows[0].n > 0;
+        });
+        if (completed) {
+          await completeJobRun({
+            handle: job,
+            result: {
+              skipped: true,
+              skip_reason: "file_dedupe",
+              existing_file_id: evidenceFile.id,
+              concurrent_insert: true,
+            },
+          });
+          return {
+            status: "skipped",
+            filename: args.filename,
+            evidence_file_id: null,
+            existing_file_id: evidenceFile.id,
+            skip_reason: "file_dedupe",
+            job_run_id: job.id,
+            duration_ms: Date.now() - startTime,
+            file_size_bytes: args.file_bytes.length,
+            storage_path: args.file_path,
+          };
+        }
+      }
     }
 
     // prompts is a system table — load on service_role.
@@ -444,7 +509,7 @@ export async function ingestFile(args: IngestFileArgs): Promise<IngestFileResult
     // Final atomic scoped write: insert extracted_evidence + link + mark extracted.
     // The trg_extracted_evidence_engagement trigger auto-derives engagement_id from
     // the evidence_files parent, so we omit it here.
-    const extractedRow = await withEngagementScope(engagementId, async (tx) => {
+    const extractedWrite = await withEngagementScope(engagementId, async (tx) => {
       const [row] = await tx<{ id: string }[]>`
         insert into extracted_evidence
           (evidence_file_id, extractor_prompt_id, extracted_content, raw_extracted_text,
@@ -456,19 +521,50 @@ export async function ingestFile(args: IngestFileArgs): Promise<IngestFileResult
            ${extraction.scratchpad ?? null},
            ${JSON.stringify(embedding)},
            ${extraction.total_input_tokens}, ${extraction.total_output_tokens})
+        on conflict (evidence_file_id, extractor_prompt_id) do nothing
         returning id
       `;
-      if (!row) throw new Error("Failed to insert extracted_evidence: no row returned");
+      const persisted = row ?? (await findExistingExtraction(
+        tx,
+        evidenceFileId!,
+        extraction.extractor_prompt_id,
+      ));
+      if (!persisted) throw new Error("Failed to persist or reuse extracted_evidence");
       await linkFileToControl(tx, evidenceFileId!, args.control_id);
       await updateEvidenceFileStatus(tx, evidenceFileId!, "extracted", null);
-      return row;
+      return { id: persisted.id, inserted: !!row };
     });
+
+    if (!extractedWrite.inserted) {
+      await completeJobRun({
+        handle: job,
+        result: {
+          skipped: true,
+          skip_reason: "extraction_dedupe",
+          evidence_file_id: evidenceFileId,
+          existing_extraction_id: extractedWrite.id,
+          concurrent_extraction: true,
+        },
+      });
+      return {
+        status: "skipped",
+        filename: args.filename,
+        evidence_file_id: evidenceFileId,
+        existing_extraction_id: extractedWrite.id,
+        skip_reason: "extraction_dedupe",
+        job_run_id: job.id,
+        duration_ms: Date.now() - startTime,
+        file_type: fileType,
+        file_size_bytes: args.file_bytes.length,
+        storage_path: args.file_path,
+      };
+    }
 
     await completeJobRun({
       handle: job,
       result: {
         evidence_file_id: evidenceFileId,
-        extracted_evidence_id: extractedRow.id,
+        extracted_evidence_id: extractedWrite.id,
         file_type: fileType,
         file_size_bytes: args.file_bytes.length,
         extractor_prompt_id: extraction.extractor_prompt_id,
@@ -485,7 +581,7 @@ export async function ingestFile(args: IngestFileArgs): Promise<IngestFileResult
       status: "extracted",
       filename: args.filename,
       evidence_file_id: evidenceFileId,
-      extracted_evidence_id: extractedRow.id,
+      extracted_evidence_id: extractedWrite.id,
       job_run_id: job.id,
       duration_ms: Date.now() - startTime,
       tokens: {
@@ -505,7 +601,7 @@ export async function ingestFile(args: IngestFileArgs): Promise<IngestFileResult
       // Best-effort status update on failure — don't let this throw suppress the real error.
       await withEngagementScope(
         engagementId,
-        (tx) => updateEvidenceFileStatus(tx, evidenceFileId!, "failed", e.message),
+        (tx) => markEvidenceFileFailedUnlessExtracted(tx, evidenceFileId!, e.message),
       ).catch((se) => console.error(`Failed to mark evidence_file failed: ${se.message}`));
     }
     await failJobRun({ handle: job, error_message: e.message, error_stack: e.stack });

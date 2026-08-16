@@ -175,14 +175,13 @@ export interface AirtableRecord {
   fields: Record<string, unknown>;
 }
 
-// Read one Airtable record. `fields` limits the response to only the columns a
-// caller needs; this is used by evidence sync to inspect V3_Evidence before
-// deciding whether Google Drive is needed.
+// Read one Airtable record. Airtable's `fields[]` projection belongs to the
+// list-records endpoint and is rejected on this single-record endpoint, so this
+// helper intentionally requests the complete record.
 export async function getAirtableRecord(args: {
   baseId: string | null;
   tableId: string;
   recordId: string | null;
-  fields?: string[];
 }): Promise<AirtableGetResult> {
   if (!args.recordId) return { attempted: false, ok: true, skip_reason: "no_record_id" };
   if (!args.baseId) return { attempted: false, ok: true, skip_reason: "no_base_id" };
@@ -193,7 +192,6 @@ export async function getAirtableRecord(args: {
   const url = new URL(
     `https://api.airtable.com/v0/${args.baseId}/${args.tableId}/${args.recordId}`,
   );
-  for (const field of args.fields ?? []) url.searchParams.append("fields[]", field);
 
   try {
     const resp = await fetchWithRetry(url, {

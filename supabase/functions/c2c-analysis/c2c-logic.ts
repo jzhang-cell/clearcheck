@@ -244,6 +244,7 @@ export function buildAirtableControlFields(args: {
   baselineRecordId: string;
   tscRecordIds: string[];
   ownerFieldType?: string;
+  overviewRecordId: string;
 }): Record<string, unknown> {
   return {
     "Control ID": args.control.control_id,
@@ -251,6 +252,7 @@ export function buildAirtableControlFields(args: {
     "Control Description": args.control.control_description,
     "TSC Criteria": args.tscRecordIds,
     "Owner": formatOwnerValue(args.control.owner, args.ownerFieldType),
+    "Overview": [args.overviewRecordId],
   };
 }
 

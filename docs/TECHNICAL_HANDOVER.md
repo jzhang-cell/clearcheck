@@ -16,7 +16,7 @@ source commit `052c55d`. The synchronization includes:
 
 - `audit-worker` and the durable `audit_queue` handoff;
 - `make-extraction-callback`;
-- migrations `0015`–`0018`;
+- migrations `0015`–`0019`;
 - `evidence_sync_runs` and `external_extraction_jobs`;
 - Airtable `V3_Evidence` priority over Google Drive;
 - Make.com execution links and stale-job recovery;
@@ -126,6 +126,16 @@ database state and the final Airtable message—not by the initial `202`.
 - **Run with Additional Evidence / Additional Notes:** runs a remediation pass
   using the prior conclusion plus only the new attachments or notes.
 
+Every re-run supplies the current Airtable Control Description and Expected
+Procedures and uses them exactly as provided; `refine-control` is not called
+again, because those inputs are already auditor-approved. Where the scope has
+changed, the superseded determination is withheld from the remediation prompt so
+obsolete testing steps cannot be carried forward.
+
+If a control has no previous verdict, remediation has nothing to re-assess. The
+staged evidence is ingested and the standard audit pipeline produces a first
+result instead of returning an error.
+
 Remediation attachments currently use the local extractor path. The Make.com
 continuation belongs to the durable initial evidence-sync path.
 
@@ -142,7 +152,7 @@ The complete production system contains eleven functions:
 
 | Function | Authentication | Responsibility |
 |---|---|---|
-| `register-engagement` | Shared system secret | Upsert engagement, store Airtable/Drive identifiers, mint an engagement key |
+| `register-engagement` | Shared system secret | Upsert engagement, store Airtable/Drive identifiers, mint an engagement key. Called by the Make.com onboarding scenario |
 | `c2c-analysis` | Engagement key | Import the Client Control CSV, upsert Airtable controls, and classify baseline description changes |
 | `register-control` | Engagement key | Upsert control and TSC links |
 | `refine-control` | Engagement key | Refine the expected procedures only; the original control description is preserved |
@@ -150,7 +160,7 @@ The complete production system contains eleven functions:
 | `make-extraction-callback` | Make callback secret | Complete or fail an external large-PDF job and resume its sync |
 | `audit-worker` | Shared system secret | Claim durable audit jobs and run the audit pipeline |
 | `run-audit` | Engagement key | Direct entry point to the shared audit pipeline |
-| `rerun-audit` | Engagement key | Reassess a prior result using new evidence or notes |
+| `rerun-audit` | Engagement key | Reassess a prior result using new evidence or notes; runs a first audit when there is no prior result |
 | `pace-controls` | Engagement key | Pace engagement-wide launches |
 | `sweep-stuck-jobs` | Shared secret or engagement key, by mode | Clean stale work and recover selected controls |
 
@@ -177,7 +187,7 @@ applies.
 Airtable is the user interface, not the workflow source of truth. Diagnose a
 problem from Supabase first, then compare the Airtable write-back.
 
-The complete production schema currently includes migrations through `0018`.
+The complete production schema currently includes migrations through `0019`.
 Migrations are forward-only. Never edit a migration that has already been
 applied; add a new migration.
 

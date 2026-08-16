@@ -21,9 +21,13 @@ deployment and architecture details, see
 1. Duplicate and configure the approved Airtable template.
 2. Confirm the Airtable base ID and engagement record.
 3. Confirm the Google Drive evidence root and delegated subject.
-4. Run the Airtable registration automation.
-5. Save the returned engagement UUID and per-engagement key in the configured
-   Airtable fields.
+4. Run the Make.com onboarding scenario. It calls `register-engagement` with the
+   client, attestation dates, Drive identifiers, and Airtable identifiers, and
+   writes the returned engagement UUID and per-engagement key back to the Audit
+   Overview row.
+5. Confirm both `supabase_uuid` and `supabase_key` are present and non-empty on
+   that row. The key is returned only when the engagement is created; an
+   idempotent re-run omits it, and the existing value must be preserved.
 6. Verify the engagement row in Supabase.
 7. Place the client's control list as a single CSV in the engagement's
    `Client Control` Drive folder.

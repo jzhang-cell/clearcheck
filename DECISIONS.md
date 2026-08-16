@@ -175,6 +175,22 @@
   2. **The create branch is the future mint point for per-engagement keys.** When ADR-011 resumes, key generation (random → `pgcrypto` hash stored on the row → plaintext returned **once**, only on create) belongs in `register-engagement`'s INSERT path, symmetric with the existing `supabase_uuid` write-back. Update path never returns a key (can't un-hash).
   3. **`engagements.slug` is now optional/deferred.** With the UUID auto-generated and `engagement-slug.ts` already falling back to the UUID, new clients get a working Storage path with zero config. The slug column is purely cosmetic (readable folders) and no longer gates onboarding — defer it.
 
+### ADR-012 caller update (2026-08): Make.com owns registration
+
+- **Decision:** The existing Make onboarding scenario is the sole caller of
+  `register-engagement`. It already holds the client metadata, attestation dates,
+  Google Drive IDs, and Airtable identifiers the endpoint requires.
+- **Ordering:** Make registers the engagement and saves `supabase_uuid` plus the
+  create-only `supabase_key` to the Audit Overview row; C2C reads that saved key;
+  the Airtable master script verifies both values are present and then starts
+  Run V3.
+- **Key safety:** Make must preserve the existing Airtable key whenever an
+  idempotent update response omits `api_key`. The plaintext is returned only on
+  creation and cannot be recovered from its stored hash.
+- **Auth boundary:** The shared `AUDIT_SHARED_SECRET` lives in Supabase and in
+  Make's secured HTTP credentials. It is not stored in Airtable. Downstream C2C
+  and per-control calls continue to use only the per-engagement key.
+
 ---
 
 ## ADR-013: Re-run as a remediation (delta) pass — `rerun-audit` + `audit_remediation` prompt

@@ -438,9 +438,20 @@ Deno.serve(async (req: Request) => {
              ${tx.json(extractedContent as Parameters<typeof tx.json>[0])},
              ${rawText}, ${scratchpad}, ${JSON.stringify(embedding)},
              ${inputTokens}, ${outputTokens})
+          on conflict (evidence_file_id, extractor_prompt_id) do nothing
           returning id
         `;
         id = inserted[0]?.id;
+        if (!id) {
+          const raced = await tx<{ id: string }[]>`
+            select id from extracted_evidence
+            where evidence_file_id = ${job.evidence_file_id}
+              and extractor_prompt_id = ${job.extractor_prompt_id}
+              and extracted_content is not null
+            limit 1
+          `;
+          id = raced[0]?.id;
+        }
       }
       if (!id) throw new Error("Failed to create extracted_evidence row");
       await tx`

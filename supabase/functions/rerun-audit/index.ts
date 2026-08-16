@@ -10,6 +10,8 @@
 // Contract:
 //   POST body: {
 //     control_uuid: string,                 // controls.id (UUID) — required
+//     control_description: string,          // current Airtable text — required
+//     expected_procedures: string,          // current Airtable text — required
 //     mode?: "evidence" | "notes",          // intent hint (forgiving; see below)
 //     additional_evidence?: { url, filename }[], // Airtable [Additional Evidence]
 //     additional_notes?: string,            // Airtable [Additional Notes]
@@ -24,6 +26,7 @@
 // Async: acks 202 fast (Airtable's ~30s script cap), ingests + judges in a
 // background task, and writes its own results + 💬 back to Airtable when done.
 import { getServiceClient } from "../_shared/supabase-client.ts";
+import { runAuditPipeline } from "../_shared/audit-pipeline.ts";
 import { withEngagementScope } from "../_shared/scoped-db.ts";
 import type { Sql } from "../_shared/scoped-db.ts";
 import { callClaude } from "../_shared/claude-client.ts";
@@ -37,10 +40,17 @@ import {
 } from "../_shared/claude-parse.ts";
 import { resolveEngagementByKey } from "../_shared/auth.ts";
 import { engagementSlug } from "../_shared/engagement-slug.ts";
+import { storageObjectFilename } from "../_shared/storage-object-name.ts";
 import { ingestFile } from "../_shared/ingest-file.ts";
 import type { IngestFileResult } from "../_shared/ingest-file.ts";
 import { createAirtableRecord, patchAirtableRecord } from "../_shared/airtable.ts";
 import type { SupabaseClient } from "npm:@supabase/supabase-js@^2";
+import {
+  additionalEvidenceFailureMessage,
+  hasRerunScopeChanged,
+  parseRerunScopeInput,
+} from "./rerun-logic.ts";
+import { checkWorkpaperScope, scopeSafeWorkpaperFallback } from "./workpaper-scope.ts";
 
 const FUNCTION_NAME = "rerun-audit";
 const PROMPT_KEY = "audit_remediation";
@@ -66,6 +76,8 @@ interface Attachment {
 
 interface RequestPayload {
   control_uuid: string;
+  control_description: string;
+  expected_procedures: string;
   mode?: "evidence" | "notes";
   additional_evidence?: Attachment[];
   additional_notes?: string;
@@ -78,7 +90,6 @@ interface ControlRow {
   control_id: string;
   control_description: string | null;
   refined_expected_procedure: string | null;
-  refinement_status: string;
   airtable_record_id: string | null;
   latest_audit_run_id: string | null;
 }
@@ -133,7 +144,7 @@ async function runConcurrent<T, R>(
 async function loadControl(tx: Sql, controlId: string): Promise<ControlRow | null> {
   const rows = await tx<ControlRow[]>`
     select id, engagement_id, control_id, control_description,
-           refined_expected_procedure, refinement_status, airtable_record_id,
+           refined_expected_procedure, airtable_record_id,
            latest_audit_run_id
     from controls
     where id = ${controlId}
@@ -344,6 +355,12 @@ Deno.serve(async (req: Request) => {
   if (typeof payload.control_uuid !== "string" || !payload.control_uuid) {
     return jsonResponse({ error: "Missing or invalid 'control_uuid'" }, 400);
   }
+  const scopeInput = parseRerunScopeInput(
+    payload.control_description,
+    payload.expected_procedures,
+  );
+  if (!scopeInput.ok) return jsonResponse({ error: scopeInput.error }, 400);
+  const { controlDescription, expectedProcedures } = scopeInput;
 
   const attachments: Attachment[] = Array.isArray(payload.additional_evidence)
     ? payload.additional_evidence.filter(
@@ -369,8 +386,11 @@ Deno.serve(async (req: Request) => {
 
   // Pre-flight: scoped load of the control + its previous verdict.
   let control: ControlRow;
-  let previous: PreviousResult;
+  // Null when the control has never produced a verdict. A re-run is then not a
+  // remediation at all — the staged evidence becomes the control's first audit.
+  let previous: PreviousResult | null;
   let engagement: { attest_start: string; attest_end: string; airtable_base: string | null };
+  let scopeChanged = false;
   try {
     const loaded = await withEngagementScope(engagementId, async (tx) => {
       const c = await loadControl(tx, payload.control_uuid);
@@ -386,25 +406,15 @@ Deno.serve(async (req: Request) => {
     if (loaded.c.engagement_id !== engagementId) {
       return jsonResponse({ error: "Unauthorized" }, 403);
     }
-    if (!loaded.c.latest_audit_run_id || !loaded.prev) {
-      return jsonResponse(
-        { error: "No previous audit to re-assess. Run an initial audit first." },
-        400,
-      );
-    }
-    if (
-      loaded.c.refinement_status !== "refined" ||
-      !loaded.c.control_description ||
-      !loaded.c.refined_expected_procedure
-    ) {
-      return jsonResponse(
-        { error: "Control is not refined — run the initial audit chain first." },
-        400,
-      );
-    }
     control = loaded.c;
     previous = loaded.prev;
     engagement = loaded.eng!;
+    scopeChanged = hasRerunScopeChanged({
+      providedControlDescription: controlDescription,
+      providedExpectedProcedures: expectedProcedures,
+      storedControlDescription: control.control_description,
+      storedExpectedProcedures: control.refined_expected_procedure,
+    });
   } catch (err) {
     return jsonResponse({ error: (err as Error).message }, 500);
   }
@@ -420,6 +430,8 @@ Deno.serve(async (req: Request) => {
         mode,
         attachment_count: attachments.length,
         has_notes: notes.length > 0,
+        uses_provided_control_scope: true,
+        control_scope_changed: scopeChanged,
       },
       engagement_id: control.engagement_id,
     });
@@ -428,7 +440,9 @@ Deno.serve(async (req: Request) => {
   }
 
   const airtableBase = engagement.airtable_base;
-  const previousAuditRunId = control.latest_audit_run_id!;
+  // Null on a first-audit fallback; only the remediation path dereferences it.
+  const previousAuditRunId = control.latest_audit_run_id;
+  const hasPrevious = !!(previousAuditRunId && previous);
 
   const processRerun = async (): Promise<Response> => {
     let auditRunId: string | null = null;
@@ -451,25 +465,32 @@ Deno.serve(async (req: Request) => {
       const totalFiles = attachments.length;
       let doneFiles = 0;
       let lastBarShown = -1; // monotonic guard against out-of-order status PATCHes
+      const attachmentFailures: { filename: string; reason: string }[] = [];
       if (totalFiles > 0) {
         // Switch 💬 to a progress bar while the additional files ingest (Option B).
         await setStatus(airtableBase, control.airtable_record_id, progressBar(0, totalFiles));
         const ingestOne = async (att: Attachment): Promise<void> => {
-          const storagePath = `${slug}/${control.control_id}/${att.filename}`;
+          const storagePath = `${slug}/${control.control_id}/${
+            storageObjectFilename(att.filename)
+          }`;
           let bytes: Uint8Array;
           try {
             const resp = await fetch(att.url);
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             bytes = new Uint8Array(await resp.arrayBuffer());
           } catch (err) {
-            console.warn(`Attachment download failed (${att.filename}): ${(err as Error).message}`);
+            const reason = `Attachment download failed: ${(err as Error).message}`;
+            console.warn(`${reason} (${att.filename})`);
+            attachmentFailures.push({ filename: att.filename, reason });
             return;
           }
           const { error: upErr } = await supabase.storage
             .from(STORAGE_BUCKET)
             .upload(storagePath, bytes, { upsert: true });
           if (upErr) {
-            console.warn(`Storage upload failed (${att.filename}): ${upErr.message}`);
+            const reason = `Storage upload failed: ${upErr.message}`;
+            console.warn(`${reason} (${att.filename})`);
+            attachmentFailures.push({ filename: att.filename, reason });
             return;
           }
           const r = await ingestFile({
@@ -490,6 +511,12 @@ Deno.serve(async (req: Request) => {
           // Both freshly-extracted and dedup-skipped files carry a usable id.
           const id = r.evidence_file_id ?? r.existing_file_id ?? null;
           if (id && r.status !== "failed") newFileIds.add(id);
+          if (r.status === "failed") {
+            attachmentFailures.push({
+              filename: att.filename,
+              reason: r.error ?? "Evidence extraction failed",
+            });
+          }
         };
         await runConcurrent(attachments, EVIDENCE_CONCURRENCY, async (att) => {
           await ingestOne(att);
@@ -505,6 +532,50 @@ Deno.serve(async (req: Request) => {
         });
       }
 
+      // Never run the remediation judge over a known-partial upload. Successful
+      // files remain deduped in the DB, so the auditor can fix/re-upload only the
+      // failed files and safely re-run without paying to extract them again.
+      if (attachmentFailures.length > 0) {
+        const failure = additionalEvidenceFailureMessage(attachmentFailures, totalFiles);
+        await setStatus(airtableBase, control.airtable_record_id, failure.status);
+        await failJobRun({ handle: job, error_message: failure.error });
+        return jsonResponse({
+          error: failure.status,
+          control_uuid: control.id,
+          failed_files: attachmentFailures,
+          new_evidence_files: newFileIds.size,
+          job_run_id: job.id,
+        }, 422);
+      }
+
+      // 1b. No prior verdict → this is not a remediation. The staged files are
+      //     now ingested and linked, so run the standard audit over the control's
+      //     full evidence set instead of failing. The remediation prompt compares
+      //     against a previous determination; with none, it would have to invent
+      //     one, which must never happen on an audit record.
+      if (!hasPrevious) {
+        await setStatus(
+          airtableBase,
+          control.airtable_record_id,
+          "🧠 No earlier verdict — running the first audit on this evidence…",
+        );
+        // No `control` passed: the pipeline keeps its own richer ControlRow, so
+        // let it run its own preflight load (same as the audit-worker path).
+        const first = await runAuditPipeline({
+          engagementId,
+          controlUuid: control.id,
+          triggerSource,
+          job,
+        });
+        return jsonResponse({
+          ...first.body,
+          flow: "initial_from_rerun",
+          new_evidence_files: newFileIds.size,
+        }, first.status);
+      }
+      const prior = previous!;
+      const priorAuditRunId = previousAuditRunId!;
+
       // 2. Build the NEW Evidence Analysis from just the delta files.
       const newFileIdList = [...newFileIds];
       const newEvidence = await withEngagementScope(
@@ -517,14 +588,21 @@ Deno.serve(async (req: Request) => {
 
       // 3. Render the remediation prompt with the previous verdict + delta.
       const prompt = await loadActivePrompt(PROMPT_KEY);
+      const priorScopeOmitted =
+        "(Omitted because the current Control Description or Expected Procedures changed. " +
+        "Do not carry any testing step, artifact request, or conclusion from the superseded scope.)";
       const userText = renderTemplate(prompt.user_prompt_template, {
-        control_description: control.control_description!,
-        expected_procedures: control.refined_expected_procedure!,
+        control_description: controlDescription,
+        expected_procedures: expectedProcedures,
         attest_start: engagement.attest_start,
         attest_end: engagement.attest_end,
-        previous_conformity_level: previous.conformity_level ?? "(unknown)",
-        previous_determination: previous.conformity_determination ?? "(none recorded)",
-        previous_clarifications: previous.potential_clarifications ?? "(none)",
+        previous_conformity_level: prior.conformity_level ?? "(unknown)",
+        previous_determination: scopeChanged
+          ? priorScopeOmitted
+          : prior.conformity_determination ?? "(none recorded)",
+        previous_clarifications: scopeChanged
+          ? priorScopeOmitted
+          : prior.potential_clarifications ?? "(none)",
         additional_evidence_analysis: additionalEvidenceAnalysis,
         additional_notes: notes.length > 0 ? notes : "(none)",
       });
@@ -540,7 +618,7 @@ Deno.serve(async (req: Request) => {
             (${control.engagement_id}, ${control.id}, ${newFileIdList}::uuid[],
              ${additionalEvidenceAnalysis}, ${prompt.prompt_id}, 'running',
              ${triggerSource}, 'remediation', ${notes.length > 0 ? notes : null},
-             ${previousAuditRunId})
+             ${priorAuditRunId})
           returning id
         `;
         if (!row) throw new Error("Failed to insert audit_runs: no row returned");
@@ -603,23 +681,48 @@ Deno.serve(async (req: Request) => {
       // 6. Workpaper Result render (Sonnet, temperature 0) — best-effort. Auditor
       //    notes flow into the prompt's existing ENGAGEMENT CONTEXT slot.
       let workpaperText: string | null = null;
+      let workpaperScopeFallback = false;
       try {
         const wpPrompt = await loadActivePrompt(WORKPAPER_PROMPT_KEY);
-        const wpUserText = renderTemplate(wpPrompt.user_prompt_template, {
-          control_description: control.control_description!,
-          expected_procedures: control.refined_expected_procedure!,
-          conformity_determination: audit.conformity_determination,
-          additional_comments: notes,
-        });
-        const wpClaude = await callClaude({
-          model: wpPrompt.model,
-          system: wpPrompt.system_prompt,
-          user: wpUserText,
-          max_tokens: wpPrompt.max_tokens,
-          temperature: 0,
-        });
-        let body = wpClaude.text.replace(/^[\s\S]*?<\/scratchpad>\s*/i, "").trim();
-        if (body.length === 0) body = wpClaude.text.trim();
+        let body = "";
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const correction = attempt === 1
+            ? ""
+            : "MANDATORY SCOPE CORRECTION: The previous draft created inspection sections " +
+              "that do not exist in the current Expected Procedures. Regenerate using the " +
+              "current Expected Procedures as the sole section authority. Inquiry-only " +
+              "procedures require zero numbered inspection sections.";
+          const wpUserText = renderTemplate(wpPrompt.user_prompt_template, {
+            control_description: controlDescription,
+            expected_procedures: expectedProcedures,
+            conformity_determination: audit.conformity_determination,
+            additional_comments: [notes, correction].filter(Boolean).join("\n\n"),
+          });
+          const wpClaude = await callClaude({
+            model: wpPrompt.model,
+            system: wpPrompt.system_prompt,
+            user: wpUserText,
+            max_tokens: wpPrompt.max_tokens,
+            temperature: 0,
+          });
+          body = wpClaude.text.replace(/^[\s\S]*?<\/scratchpad>\s*/i, "").trim();
+          if (body.length === 0) body = wpClaude.text.trim();
+
+          const scopeCheck = checkWorkpaperScope(expectedProcedures, body);
+          if (scopeCheck.ok) break;
+          console.warn(
+            `Workpaper scope mismatch (attempt ${attempt}/2): ` +
+              `${scopeCheck.renderedInspectionSections} rendered inspection section(s), ` +
+              `${scopeCheck.expectedInspectionSteps} allowed by current Expected Procedures`,
+          );
+          if (attempt === 2) {
+            body = scopeSafeWorkpaperFallback(
+              audit.conformity_status === "Conforming",
+              audit.conformity_determination,
+            );
+            workpaperScopeFallback = true;
+          }
+        }
         workpaperText = body;
         await withEngagementScope(
           engagementId,
@@ -682,7 +785,7 @@ Deno.serve(async (req: Request) => {
           audit_run_id: auditRunId,
           audit_result_id: resultData.id,
           run_type: "remediation",
-          previous_audit_run_id: previousAuditRunId,
+          previous_audit_run_id: priorAuditRunId,
           mode,
           conformity_status: audit.conformity_status,
           conformity_level: audit.conformity_level,
@@ -690,6 +793,8 @@ Deno.serve(async (req: Request) => {
           new_evidence_files: newFileIdList.length,
           evidence_attachments_written: signedUrls.length,
           had_notes: notes.length > 0,
+          control_scope_changed: scopeChanged,
+          workpaper_scope_fallback: workpaperScopeFallback,
           input_tokens: claude.input_tokens,
           output_tokens: claude.output_tokens,
           cost_usd: cost,

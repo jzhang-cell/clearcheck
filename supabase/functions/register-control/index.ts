@@ -23,6 +23,7 @@
 //     company_control?: string,
 //     control_description?: string,
 //     expected_procedures?: string,
+//     use_procedures_as_provided?: boolean, // re-run only: skip AI refinement
 //     tsc_uuids?: string[],            // Supabase tscs.id UUIDs — replaces prior links
 //     airtable_record_id?: string,
 //     trigger_source?: string,
@@ -32,6 +33,8 @@
 import { withEngagementScope } from "../_shared/scoped-db.ts";
 import { completeJobRun, failJobRun, startJobRun } from "../_shared/job-run.ts";
 import { resolveEngagementByKey } from "../_shared/auth.ts";
+import { normalizeControlCode } from "../_shared/control-code.ts";
+import { buildControlUpsertFields } from "./register-logic.ts";
 
 const FUNCTION_NAME = "register-control";
 
@@ -40,6 +43,7 @@ interface RequestPayload {
   company_control?: string;
   control_description?: string;
   expected_procedures?: string;
+  use_procedures_as_provided?: boolean;
   tsc_uuids?: string[];
   airtable_record_id?: string;
   trigger_source?: string;
@@ -67,14 +71,40 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
   }
 
-  if (typeof payload.control_id !== "string" || !payload.control_id) {
+  if (typeof payload.control_id !== "string") {
     return jsonResponse({ error: "Missing required field: control_id" }, 400);
+  }
+  const rawControlId = payload.control_id;
+  const controlId = normalizeControlCode(rawControlId);
+  if (!controlId) return jsonResponse({ error: "Missing required field: control_id" }, 400);
+  if (
+    payload.use_procedures_as_provided !== undefined &&
+    typeof payload.use_procedures_as_provided !== "boolean"
+  ) {
+    return jsonResponse({ error: "'use_procedures_as_provided' must be a boolean" }, 400);
+  }
+  if (
+    payload.use_procedures_as_provided === true &&
+    (typeof payload.control_description !== "string" || !payload.control_description.trim() ||
+      typeof payload.expected_procedures !== "string" || !payload.expected_procedures.trim())
+  ) {
+    return jsonResponse(
+      {
+        error:
+          "'use_procedures_as_provided' requires non-empty 'control_description' and 'expected_procedures'",
+      },
+      400,
+    );
   }
 
   const job = await startJobRun({
     function_name: FUNCTION_NAME,
     trigger_source: payload.trigger_source ?? "airtable",
-    payload: payload as unknown as Record<string, unknown>,
+    payload: {
+      ...payload,
+      control_id: controlId,
+      control_id_was_normalized: controlId !== rawControlId,
+    } as unknown as Record<string, unknown>,
     engagement_id: engagementId,
   }).catch(() => null);
   if (!job) return jsonResponse({ error: "Failed to start job_run" }, 500);
@@ -93,36 +123,75 @@ Deno.serve(async (req: Request) => {
       engagementId,
       async (tx) => {
         // ── 1. Upsert the control row. ──────────────────────────────────────
-        const fields: Record<string, unknown> = {
-          engagement_id: engagementId,
-          control_id: payload.control_id,
-          updated_at: new Date().toISOString(),
-        };
-        if (typeof payload.company_control === "string") fields.company_control = payload.company_control;
-        if (typeof payload.control_description === "string") fields.control_description = payload.control_description;
-        if (typeof payload.expected_procedures === "string") fields.expected_procedures = payload.expected_procedures;
-        if (typeof payload.airtable_record_id === "string") fields.airtable_record_id = payload.airtable_record_id;
+        const fields = buildControlUpsertFields({
+          engagementId,
+          controlId,
+          updatedAt: new Date().toISOString(),
+          companyControl: payload.company_control,
+          controlDescription: payload.control_description,
+          expectedProcedures: payload.expected_procedures,
+          useProceduresAsProvided: payload.use_procedures_as_provided === true,
+          airtableRecordId: payload.airtable_record_id,
+        });
 
         // porsager/postgres: spread the fields object via sql(fields) into an
         // INSERT … ON CONFLICT DO UPDATE. We build the column list + values
         // explicitly so the upsert stays readable and the conflict target is clear.
         const cols = Object.keys(fields);
-        const vals = cols.map((c) => fields[c]);
-        // Raw tagged template for the upsert; conflict target uses raw identifiers.
-        const [upserted] = await tx<{ id: string; created_at: string; updated_at: string }[]>`
-          insert into controls ${tx(fields, ...cols as [string, ...string[]])}
-          on conflict (engagement_id, control_id)
-          do update set ${tx(
-            Object.fromEntries(
-              cols.filter((c) => c !== "engagement_id" && c !== "control_id")
-                .map((c) => [c, fields[c]]),
-            ),
-          )}
-          returning id, created_at, updated_at
+        let upserted!: { id: string; created_at: string; updated_at: string };
+        let created = false;
+
+        // Preserve the existing control UUID when an imported Airtable code only
+        // differs by invisible characters. Updating that row in place keeps its
+        // evidence links and audit history attached to the same control.
+        let rawMatch: { id: string } | undefined;
+        if (rawControlId !== controlId) {
+          [rawMatch] = await tx<{ id: string }[]>`
+            select id from controls
+            where engagement_id = ${engagementId} and control_id = ${rawControlId}
+            limit 1
+          `;
+        }
+        const [normalizedMatch] = await tx<{ id: string }[]>`
+          select id from controls
+          where engagement_id = ${engagementId} and control_id = ${controlId}
+          limit 1
         `;
 
+        if (rawMatch && !normalizedMatch) {
+          const updateFields = Object.fromEntries(
+            cols.filter((c) => c !== "engagement_id").map((c) => [c, fields[c]]),
+          );
+          const updateCols = Object.keys(updateFields);
+          [upserted] = await tx<
+            { id: string; created_at: string; updated_at: string }[]
+          >`
+            update controls
+            set ${tx(updateFields, ...updateCols as [string, ...string[]])}
+            where id = ${rawMatch.id}
+            returning id, created_at, updated_at
+          `;
+        } else {
+          // Raw tagged template for the upsert; conflict target uses raw identifiers.
+          [upserted] = await tx<
+            { id: string; created_at: string; updated_at: string }[]
+          >`
+            insert into controls ${tx(fields, ...cols as [string, ...string[]])}
+            on conflict (engagement_id, control_id)
+            do update set ${
+            tx(
+              Object.fromEntries(
+                cols.filter((c) => c !== "engagement_id" && c !== "control_id")
+                  .map((c) => [c, fields[c]]),
+              ),
+            )
+          }
+            returning id, created_at, updated_at
+          `;
+          created = upserted.created_at === upserted.updated_at;
+        }
+
         const controlUuid = upserted.id;
-        const created = upserted.created_at === upserted.updated_at;
 
         // ── 2. Replace TSC links (if provided) or read existing ones. ───────
         let tscUuidsLinked: string[] = [];

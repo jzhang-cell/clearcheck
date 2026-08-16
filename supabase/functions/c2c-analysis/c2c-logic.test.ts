@@ -72,6 +72,7 @@ Deno.test("maps the CSV control ID into both Airtable control ID fields", () => 
       baselineRecordId: "recBaseline",
       tscRecordIds: ["recCriteria"],
       ownerFieldType: "singleSelect",
+      overviewRecordId: "recbN7FPFFMr3KxRw",
     }),
     {
       "Control ID": "CC.01.01",
@@ -79,6 +80,7 @@ Deno.test("maps the CSV control ID into both Airtable control ID fields", () => 
       "Control Description": "The board reviews security annually.",
       "TSC Criteria": ["recCriteria"],
       "Owner": { name: "Alex" },
+      "Overview": ["recbN7FPFFMr3KxRw"],
     },
   );
 });
